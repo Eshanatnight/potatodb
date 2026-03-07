@@ -1,0 +1,11 @@
+[package]
+name = "potatodb-repl"
+description = "Line-mode interactive SQL REPL for PotatoDB"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+potatodb-engine.workspace = true
+potatodb-display.workspace = true
+chrono.workspace = true
+rustyline.workspace = true

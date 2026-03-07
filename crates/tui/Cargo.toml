@@ -1,0 +1,12 @@
+[package]
+name = "potatodb-tui"
+description = "Full-screen terminal UI for PotatoDB"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+potatodb-engine.workspace = true
+potatodb-display.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+ratatui.workspace = true

@@ -1,0 +1,184 @@
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+
+use potatodb_engine::{PotatoDB, QueryResult};
+
+#[derive(Clone)]
+struct AppState {
+    db: Arc<RwLock<PotatoDB>>,
+}
+
+#[derive(Deserialize)]
+struct QueryRequest {
+    sql: String,
+}
+
+#[derive(Serialize)]
+struct QueryResponse {
+    kind: String,
+    message: Option<String>,
+    display: Option<String>,
+    rows: usize,
+}
+
+#[derive(Serialize)]
+struct TableStats {
+    table: String,
+    parquet_files: usize,
+    total_bytes: u64,
+    oldest_file_age_secs: u64,
+}
+
+/// Starts the HTTP API server.
+///
+/// # Errors
+///
+/// Returns an error if binding to the address or serving fails.
+pub async fn start_http(
+    db: Arc<RwLock<PotatoDB>>,
+    bind_addr: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let app = build_router(db);
+    let listener = TcpListener::bind(bind_addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn build_router(db: Arc<RwLock<PotatoDB>>) -> Router {
+    let state = AppState { db };
+    Router::new()
+        .route("/health", get(health))
+        .route("/tables", get(list_tables))
+        .route("/tables/{name}/stats", get(table_stats))
+        .route("/query", post(run_query))
+        .with_state(state)
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn list_tables(State(state): State<AppState>) -> Json<Vec<String>> {
+    let db = state.db.read().await;
+    Json(db.table_names())
+}
+
+async fn table_stats(Path(name): Path<String>, State(state): State<AppState>) -> Json<TableStats> {
+    let db = state.db.read().await;
+    let parquet_files = db.parquet_file_count(&name).await.unwrap_or(0);
+    let total_bytes = db.table_total_bytes(&name).await.unwrap_or(0);
+    let oldest_file_age_secs = db.table_oldest_file_age_secs(&name).await.unwrap_or(0);
+    drop(db);
+    Json(TableStats {
+        table: name,
+        parquet_files,
+        total_bytes,
+        oldest_file_age_secs,
+    })
+}
+
+async fn run_query(
+    State(state): State<AppState>,
+    Json(req): Json<QueryRequest>,
+) -> Json<QueryResponse> {
+    let mut db = state.db.write().await;
+    match db.execute(&req.sql).await {
+        Ok(QueryResult::Message(msg)) => Json(QueryResponse {
+            kind: "message".to_string(),
+            message: Some(msg),
+            display: None,
+            rows: 0,
+        }),
+        Ok(QueryResult::Records(batches)) => {
+            let rows = batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            Json(QueryResponse {
+                kind: "records".to_string(),
+                message: None,
+                display: Some(potatodb_display::format_batches(&batches)),
+                rows,
+            })
+        }
+        Err(err) => Json(QueryResponse {
+            kind: "error".to_string(),
+            message: Some(err.to_string()),
+            display: None,
+            rows: 0,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn test_http_routes_health_tables_and_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        let db = Arc::new(RwLock::new(db));
+        let app = build_router(db.clone());
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        {
+            let mut db = db.write().await;
+            db.execute("CREATE TABLE http_t (id INT);").await.unwrap();
+            db.execute("INSERT INTO http_t VALUES (1), (2);")
+                .await
+                .unwrap();
+        }
+
+        let tables = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/tables")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tables.status(), StatusCode::OK);
+
+        let query = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        "{\"sql\":\"SELECT COUNT(*) AS c FROM http_t;\"}",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query.status(), StatusCode::OK);
+    }
+}

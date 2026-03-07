@@ -1,0 +1,17 @@
+[package]
+name = "potatodb-server"
+description = "PostgreSQL wire protocol server for PotatoDB"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+potatodb-engine.workspace = true
+arrow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+pgwire = "0.38.0"
+tokio.workspace = true
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+tokio-rustls = "0.26"

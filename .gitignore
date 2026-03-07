@@ -1,0 +1,9 @@
+.idea/
+.venv/
+build/
+target/
+dist/
+potatodb_data/
+.potatodb_history
+.idea/
+**/*/__pycache__/

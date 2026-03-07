@@ -1,0 +1,13 @@
+[package]
+name = "potatodb-wal"
+description = "Write-ahead log for PotatoDB crash recovery"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+crc32fast = "1"
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

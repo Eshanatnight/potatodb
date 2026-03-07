@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "crates/catalog",
+    "crates/display",
+    "crates/engine",
+    "crates/ffi",
+    "crates/repl",
+    "crates/tui",
+    "crates/wal",
+    "crates/server",
+    "crates/http",
+    "crates/potatodb",
+    "crates/python",
+    "examples",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+
+[workspace.dependencies]
+arrow = { version = "57", features = ["prettyprint"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+datafusion = "52"
+futures = "0.3"
+object_store = { version = "0.12", features = ["aws"] }
+parquet = "57"
+ratatui = "0.30"
+rustyline = "17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlparser = "0.59"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+async-trait = "0.1"
+crc32fast = "1"
+
+potatodb-catalog = { path = "crates/catalog" }
+potatodb-display = { path = "crates/display" }
+potatodb-engine = { path = "crates/engine" }
+potatodb-repl = { path = "crates/repl" }
+potatodb-ffi = { path = "crates/ffi" }
+potatodb-wal = { path = "crates/wal" }
+potatodb-server = { path = "crates/server" }
+potatodb-tui = { path = "crates/tui" }
+potatodb-python = { path = "crates/python" }
+potatodb-http = { path = "crates/http" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release.build-override]
+opt-level = 3

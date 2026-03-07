@@ -1,0 +1,14 @@
+[package]
+name = "potatodb"
+description = "A Parquet-backed SQL database powered by DataFusion"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+potatodb-engine.workspace = true
+potatodb-display.workspace = true
+potatodb-repl.workspace = true
+potatodb-tui.workspace = true
+potatodb-http.workspace = true
+clap.workspace = true
+tokio.workspace = true

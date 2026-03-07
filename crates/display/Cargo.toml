@@ -1,0 +1,8 @@
+[package]
+name = "potatodb-display"
+description = "Result formatting utilities for PotatoDB"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true

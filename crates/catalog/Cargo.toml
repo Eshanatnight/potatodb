@@ -1,0 +1,14 @@
+[package]
+name = "potatodb-catalog"
+description = "Persistent catalog for PotatoDB table and index metadata"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+object_store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

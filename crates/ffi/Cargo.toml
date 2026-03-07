@@ -1,0 +1,15 @@
+[package]
+name = "potatodb-ffi"
+description = "C/C++ FFI bindings for the PotatoDB engine"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+potatodb-engine.workspace = true
+potatodb-display.workspace = true
+arrow.workspace = true
+tokio.workspace = true
+futures.workspace = true

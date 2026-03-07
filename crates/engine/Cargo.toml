@@ -1,0 +1,30 @@
+[package]
+name = "potatodb-engine"
+description = "Core SQL engine for PotatoDB"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+potatodb-catalog.workspace = true
+potatodb-wal.workspace = true
+async-trait.workspace = true
+arrow.workspace = true
+chrono.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+object_store.workspace = true
+parquet.workspace = true
+sqlparser.workspace = true
+url.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+arrow.workspace = true
+criterion = { version = "0.8.2", features = ["html_reports"] }
+potatodb-wal.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "engine_bench"
+harness = false

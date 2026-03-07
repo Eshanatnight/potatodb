@@ -1,0 +1,13 @@
+[package]
+name = "potatodb-examples"
+description = "Example programs demonstrating PotatoDB use cases"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+potatodb-engine.workspace = true
+potatodb-display.workspace = true
+potatodb-server.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
