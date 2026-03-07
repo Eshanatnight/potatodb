@@ -2,6 +2,9 @@
 
 A Parquet-backed SQL database written in Rust, powered by [Apache DataFusion](https://datafusion.apache.org/).
 
+![Rust](https://img.shields.io/badge/Rust-2021-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 ## Features
 
 - **Parquet-native SQL engine** -- DataFusion-powered query execution over Zstd-compressed Parquet with bloom/page pruning
@@ -420,31 +423,31 @@ REVOKE SELECT ON orders FROM analyst;
 
 ### Supported SQL (via DataFusion)
 
-| Category           | Examples                                                        |
-|--------------------|-----------------------------------------------------------------|
-| Queries            | `SELECT`, `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`   |
-| Joins              | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`                      |
-| Aggregations       | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `APPROX_MEDIAN` |
-| Window functions   | `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, `NTILE`                   |
-| Set operations     | `UNION`, `EXCEPT`, `INTERSECT`                                  |
-| Subqueries & CTEs  | `WITH ... AS`, correlated and uncorrelated subqueries           |
-| Transactions       | `BEGIN`, `COMMIT`, `ROLLBACK`                                   |
-| Metadata           | `SHOW TABLES`, `DESCRIBE table`                                 |
-| Types              | `INT`, `BIGINT`, `REAL`, `DOUBLE`, `VARCHAR`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `DECIMAL`, `BYTEA`, `UUID`, `INTERVAL`, `ARRAY`, `JSON/JSONB` |
+| Category          | Examples                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Queries           | `SELECT`, `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`                                                                                |
+| Joins             | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`                                                                                                   |
+| Aggregations      | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `APPROX_MEDIAN`                                                                              |
+| Window functions  | `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, `NTILE`                                                                                                |
+| Set operations    | `UNION`, `EXCEPT`, `INTERSECT`                                                                                                              |
+| Subqueries & CTEs | `WITH ... AS`, correlated and uncorrelated subqueries                                                                                       |
+| Transactions      | `BEGIN`, `COMMIT`, `ROLLBACK`                                                                                                               |
+| Metadata          | `SHOW TABLES`, `DESCRIBE table`                                                                                                             |
+| Types             | `INT`, `BIGINT`, `REAL`, `DOUBLE`, `VARCHAR`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `DECIMAL`, `BYTEA`, `UUID`, `INTERVAL`, `ARRAY`, `JSON/JSONB` |
 
 ### REPL special commands
 
-| Command       | Description           |
-|---------------|-----------------------|
-| `\q`          | Quit                  |
-| `\dt`         | List all tables       |
-| `\d <table>`  | Describe table schema |
-| `\di`         | List indexes          |
-| `\dv`         | List views            |
-| `\backup`     | Create local archive  |
-| `\restore`    | Restore local archive |
-| `.import`     | Shorthand for COPY FROM |
-| `.export`     | Shorthand for COPY TO |
+| Command      | Description             |
+| ------------ | ----------------------- |
+| `\q`         | Quit                    |
+| `\dt`        | List all tables         |
+| `\d <table>` | Describe table schema   |
+| `\di`        | List indexes            |
+| `\dv`        | List views              |
+| `\backup`    | Create local archive    |
+| `\restore`   | Restore local archive   |
+| `.import`    | Shorthand for COPY FROM |
+| `.export`    | Shorthand for COPY TO   |
 
 ## Architecture
 
@@ -488,19 +491,19 @@ potatodb-python ── potatodb-engine
 
 ### Crate responsibilities
 
-| Crate               | Purpose                                                                 |
-|----------------------|-------------------------------------------------------------------------|
-| `potatodb-catalog`   | Persistent JSON catalog with snapshot/restore for MVCC transactions     |
-| `potatodb-display`   | Formats Arrow `RecordBatch` results as ASCII tables                     |
-| `potatodb-engine`    | Core engine: DDL, DML, transactions, DataFusion SessionContext, Parquet I/O, S3 |
-| `potatodb-ffi`       | C/C++ FFI bindings (static + shared library, C header, C++ RAII wrapper)|
-| `potatodb-repl`      | Line-mode interactive SQL shell with readline and history               |
-| `potatodb-tui`       | Full-screen ratatui terminal UI with scrollable results and sidebar     |
-| `potatodb-wal`       | Local binary WAL + replay/checkpoint support                            |
-| `potatodb-server`    | PostgreSQL wire protocol server                                          |
-| `potatodb-python`    | PyO3 Python bindings                                                     |
-| `potatodb-http`      | HTTP API server (`/health`, `/tables`, `/query`, ...)                  |
-| `potatodb`           | Binary entry point, CLI argument parsing                                |
+| Crate              | Purpose                                                                         |
+| ------------------ | ------------------------------------------------------------------------------- |
+| `potatodb-catalog` | Persistent JSON catalog with snapshot/restore for MVCC transactions             |
+| `potatodb-display` | Formats Arrow `RecordBatch` results as ASCII tables                             |
+| `potatodb-engine`  | Core engine: DDL, DML, transactions, DataFusion SessionContext, Parquet I/O, S3 |
+| `potatodb-ffi`     | C/C++ FFI bindings (static + shared library, C header, C++ RAII wrapper)        |
+| `potatodb-repl`    | Line-mode interactive SQL shell with readline and history                       |
+| `potatodb-tui`     | Full-screen ratatui terminal UI with scrollable results and sidebar             |
+| `potatodb-wal`     | Local binary WAL + replay/checkpoint support                                    |
+| `potatodb-server`  | PostgreSQL wire protocol server                                                 |
+| `potatodb-python`  | PyO3 Python bindings                                                            |
+| `potatodb-http`    | HTTP API server (`/health`, `/tables`, `/query`, ...)                           |
+| `potatodb`         | Binary entry point, CLI argument parsing                                        |
 
 ### How it works
 
@@ -562,10 +565,10 @@ cargo build --release -p potatodb-ffi
 
 Both headers live in `crates/ffi/include/`:
 
-| Header          | Language | Description                                              |
-|-----------------|----------|----------------------------------------------------------|
-| `potatodb.h`    | C11+     | Opaque handles, `extern "C"` functions, enum type tags   |
-| `potatodb.hpp`  | C++17    | Header-only RAII wrapper (no exceptions, `-fno-exceptions` safe) |
+| Header         | Language | Description                                                      |
+| -------------- | -------- | ---------------------------------------------------------------- |
+| `potatodb.h`   | C11+     | Opaque handles, `extern "C"` functions, enum type tags           |
+| `potatodb.hpp` | C++17    | Header-only RAII wrapper (no exceptions, `-fno-exceptions` safe) |
 
 ### C++ API overview
 
