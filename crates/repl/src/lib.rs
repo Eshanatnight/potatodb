@@ -107,7 +107,6 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                 if buffer.is_empty() {
                     match trimmed {
                         "\\q" | "quit" | "exit" => {
-                            println!("Bye!");
                             break;
                         }
                         "\\dt" => {
@@ -201,7 +200,6 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                 }
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
-                println!("Bye!");
                 break;
             }
             Err(err) => {
@@ -221,9 +219,9 @@ async fn execute_and_print(db: &mut PotatoDB, sql: &str) {
     match db.execute(sql).await {
         Ok(QueryResult::Records(batches)) => {
             let rows = display::row_count(&batches);
-            println!("{}", display::format_batches(&batches));
             let elapsed = Utc::now() - start;
-            println!("({rows} row(s), {elapsed})");
+            println!("({rows} row(s), {}ms)", elapsed.num_milliseconds());
+            println!("{}", display::format_batches(&batches));
         }
         Ok(QueryResult::Message(msg)) => {
             let elapsed = Utc::now() - start;

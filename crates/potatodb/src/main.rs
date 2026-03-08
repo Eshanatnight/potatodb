@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !cli.files.is_empty() {
         let mut had_error = false;
         for path in &cli.files {
-            println!("── Executing: {path}");
+            println!("Executing: {path}");
             match db.execute_file(path, false).await {
                 Ok(results) => {
                     for (stmt, result) in results {
