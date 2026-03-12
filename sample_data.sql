@@ -20,24 +20,80 @@ CREATE TABLE IF NOT EXISTS orders (
     order_date DATE NOT NULL
 );
 
-INSERT INTO customers (id, name, email, city) VALUES (1, 'Alice Johnson', 'alice@example.com', 'Seattle');
-INSERT INTO customers (id, name, email, city) VALUES (2, 'Bob Smith', 'bob@example.com', 'Portland');
-INSERT INTO customers (id, name, email, city) VALUES (3, 'Carol Lee', 'carol@example.com', 'Denver');
-INSERT INTO customers (id, name, email, city) VALUES (4, 'David Park', 'david@example.com', 'Austin');
-INSERT INTO customers (id, name, email, city) VALUES (5, 'Eva Martinez', 'eva@example.com', 'Chicago');
+-- Insert 500,000 customers
+INSERT INTO customers (id, name, email, city)
+SELECT
+    gs.value                                           AS id,
+    'Customer ' || gs.value                            AS name,
+    'customer_' || gs.value || '@example.com'          AS email,
+    CASE (gs.value % 10)
+        WHEN 0 THEN 'Seattle'
+        WHEN 1 THEN 'Portland'
+        WHEN 2 THEN 'Denver'
+        WHEN 3 THEN 'Austin'
+        WHEN 4 THEN 'Chicago'
+        WHEN 5 THEN 'San Francisco'
+        WHEN 6 THEN 'New York'
+        WHEN 7 THEN 'Boston'
+        WHEN 8 THEN 'Miami'
+        ELSE 'Dallas'
+    END                                                AS city
+FROM generate_series(1, 500000000) AS gs;
 
-INSERT INTO products (id, name, price, category) VALUES (1, 'Laptop', 999.99, 'Electronics');
-INSERT INTO products (id, name, price, category) VALUES (2, 'Headphones', 49.95, 'Electronics');
-INSERT INTO products (id, name, price, category) VALUES (3, 'Notebook', 5.50, 'Office');
-INSERT INTO products (id, name, price, category) VALUES (4, 'Desk Lamp', 34.00, 'Home');
-INSERT INTO products (id, name, price, category) VALUES (5, 'Backpack', 75.00, 'Accessories');
+-- Insert 500,000 products
+INSERT INTO products (id, name, price, category)
+SELECT
+    gs.value                                           AS id,
+    'Product ' || gs.value                             AS name,
+    CAST(1 + (random() * 999) AS INT)                  AS price,
+    CASE (gs.value % 5)
+        WHEN 0 THEN 'Electronics'
+        WHEN 1 THEN 'Office'
+        WHEN 2 THEN 'Home'
+        WHEN 3 THEN 'Accessories'
+        ELSE 'Other'
+    END                                                AS category
+FROM generate_series(1, 500000000) AS gs;
 
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (1, 1, 1, 1, '2026-01-15');
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (2, 1, 2, 2, '2026-01-20');
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (3, 2, 3, 10, '2026-02-03');
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (4, 3, 4, 1, '2026-02-10');
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (5, 4, 5, 1, '2026-02-18');
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (6, 5, 1, 1, '2026-02-25');
-INSERT INTO orders (id, customer_id, product_id, quantity, order_date) VALUES (7, 2, 2, 3, '2026-03-01');
+-- Insert 500,000 orders
+INSERT INTO orders (id, customer_id, product_id, quantity, order_date)
+SELECT
+    gs.value                                                   AS id,
+    CAST(random() * 500000 + 1 AS INT)                         AS customer_id,
+    CAST(random() * 500000 + 1 AS INT)                         AS product_id,
+    CAST(random() * 10 + 1 AS INT)                             AS quantity,
+    CURRENT_DATE - (gs.value % 365)                            AS order_date
+FROM generate_series(1, 500000000) AS gs;
 
 FLUSH;
+
+-- Join queries (examples to run against loaded data)
+
+-- Orders with customer and product details
+SELECT o.id, c.name AS customer_name, c.city, p.name AS product_name, p.category, o.quantity, o.order_date
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+WHERE o.id <= 10;
+
+-- Total order value by order (quantity * price)
+SELECT o.id, c.name, p.name AS product, o.quantity, p.price, o.quantity * p.price AS total
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+WHERE o.id <= 10;
+
+-- Order count and total revenue per customer
+SELECT c.id, c.name, c.city, COUNT(o.id) AS order_count, SUM(o.quantity * p.price) AS total_spent
+FROM customers c
+LEFT JOIN orders o ON c.id = o.customer_id
+LEFT JOIN products p ON o.product_id = p.id
+GROUP BY c.id, c.name, c.city
+HAVING COUNT(o.id) > 0
+LIMIT 20;
+
+SELECT COUNT(*) FROM ( SELECT o.id, c.name AS customer_name, c.city, p.name AS product_name, p.category, o.quantity, o.order_date
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+WHERE o.id <= 10);
