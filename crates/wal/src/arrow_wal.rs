@@ -60,17 +60,17 @@ impl ArrowWal {
 
         let file = fs::File::create(&file_path)?;
         let mut writer = FileWriter::try_new(file, &schema).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Arrow IPC writer init: {e}"))
+            io::Error::other(format!("Arrow IPC writer init: {e}"))
         })?;
 
         for batch in batches {
             writer.write(batch).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("Arrow IPC write: {e}"))
+                io::Error::other(format!("Arrow IPC write: {e}"))
             })?;
         }
 
         writer.finish().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Arrow IPC finish: {e}"))
+            io::Error::other(format!("Arrow IPC finish: {e}"))
         })?;
 
         Ok(())

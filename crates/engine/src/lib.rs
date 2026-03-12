@@ -496,7 +496,7 @@ impl PotatoDB {
         let wal_checkpoint_threshold_bytes = std::env::var("POTATODB_WAL_CHECKPOINT_BYTES")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(4 * 1024 * 1024);
+            .unwrap_or(4 * 1024 * 1024 * 1024);
         let write_buffer_row_threshold = std::env::var("POTATODB_WRITE_BUFFER_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -508,7 +508,7 @@ impl PotatoDB {
         let write_buffer_time_threshold = std::env::var("POTATODB_WRITE_BUFFER_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map_or(Duration::from_secs(60), Duration::from_millis);
+            .map_or(Duration::from_secs(360), Duration::from_millis);
         let auto_analyze_threshold_rows = std::env::var("POTATODB_AUTO_ANALYZE_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -581,8 +581,7 @@ impl PotatoDB {
                 db.replaying_wal = true;
                 for (table_name, batches) in recovered_batches {
                     if db.catalog.tables.contains_key(&table_name) {
-                        db.buffer_insert_batches(&table_name, None, batches)
-                            .await?;
+                        db.buffer_insert_batches(&table_name, None, batches).await?;
                         db.flush_table(&table_name).await?;
                     }
                 }
