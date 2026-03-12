@@ -59,19 +59,18 @@ impl ArrowWal {
         let file_path = table_dir.join(format!("{:06}.arrow", self.seq));
 
         let file = fs::File::create(&file_path)?;
-        let mut writer = FileWriter::try_new(file, &schema).map_err(|e| {
-            io::Error::other(format!("Arrow IPC writer init: {e}"))
-        })?;
+        let mut writer = FileWriter::try_new(file, &schema)
+            .map_err(|e| io::Error::other(format!("Arrow IPC writer init: {e}")))?;
 
         for batch in batches {
-            writer.write(batch).map_err(|e| {
-                io::Error::other(format!("Arrow IPC write: {e}"))
-            })?;
+            writer
+                .write(batch)
+                .map_err(|e| io::Error::other(format!("Arrow IPC write: {e}")))?;
         }
 
-        writer.finish().map_err(|e| {
-            io::Error::other(format!("Arrow IPC finish: {e}"))
-        })?;
+        writer
+            .finish()
+            .map_err(|e| io::Error::other(format!("Arrow IPC finish: {e}")))?;
 
         Ok(())
     }
@@ -121,10 +120,7 @@ impl ArrowWal {
                     let batch = batch_result.map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!(
-                                "Arrow IPC batch read {}: {e}",
-                                file_entry.path().display()
-                            ),
+                            format!("Arrow IPC batch read {}: {e}", file_entry.path().display()),
                         )
                     })?;
                     batches.push(batch);
@@ -217,8 +213,7 @@ mod tests {
             let batch2 = test_batch(&[3], &["c"]);
             wal.append("users", &[batch1]).unwrap();
             wal.append("users", &[batch2]).unwrap();
-            wal.append("orders", &[test_batch(&[10], &["x"])])
-                .unwrap();
+            wal.append("orders", &[test_batch(&[10], &["x"])]).unwrap();
         }
 
         let recovered = ArrowWal::recover(&dir).unwrap();

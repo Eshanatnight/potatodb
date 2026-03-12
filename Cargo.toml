@@ -53,7 +53,7 @@ potatodb-http = { path = "crates/http" }
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+# lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
