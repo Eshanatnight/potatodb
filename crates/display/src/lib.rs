@@ -40,7 +40,7 @@ mod tests {
             vec![
                 Arc::new(Int32Array::from(ids.to_vec())),
                 Arc::new(StringArray::from(
-                    names.iter().map(|s| *s).collect::<Vec<_>>(),
+                    names.iter().copied().collect::<Vec<_>>(),
                 )),
             ],
         )
