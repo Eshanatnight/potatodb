@@ -39,7 +39,7 @@ mod tests {
             schema,
             vec![
                 Arc::new(Int32Array::from(ids.to_vec())),
-                Arc::new(StringArray::from(names.iter().copied().collect::<Vec<_>>())),
+                Arc::new(StringArray::from(names.to_vec())),
             ],
         )
         .unwrap()
