@@ -28,7 +28,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cargo build (workspace, all targets)
-        run: cargo build --workspace --all-targets --locked --release
+        run: cargo build --workspace --all-targets --locked
 
   test:
     name: Test
