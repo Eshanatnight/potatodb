@@ -1,5 +1,9 @@
 use clap::Parser;
+use mimalloc::MiMalloc;
 use potatodb_engine::{QueryResult, S3Config};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 use potatodb_tui::ThemeChoice;
 use std::sync::Arc;
 use tokio::sync::RwLock;

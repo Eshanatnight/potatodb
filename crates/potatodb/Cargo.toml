@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+mimalloc.workspace = true
 potatodb-engine.workspace = true
 potatodb-display.workspace = true
 potatodb-repl.workspace = true

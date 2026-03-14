@@ -39,6 +39,7 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 async-trait = "0.1"
 crc32fast = "1"
+mimalloc = "0.1"
 
 potatodb-catalog = { path = "crates/catalog" }
 potatodb-display = { path = "crates/display" }
@@ -53,10 +54,11 @@ potatodb-http = { path = "crates/http" }
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+#lto = "fat"
 codegen-units = 1
-strip = true
+#strip = true
 panic = "abort"
+debug = 2
 
 [profile.release.build-override]
 opt-level = 3

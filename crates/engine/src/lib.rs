@@ -346,15 +346,57 @@ fn parse_parquet_compression(s: &str) -> parquet::basic::Compression {
 }
 
 /// Builds a [`SessionConfig`] tuned for Parquet performance.
+///
+/// Key settings can be overridden via environment variables:
+/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 8192)
+/// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 8192)
+/// - `POTATODB_TARGET_PARTITIONS` — Number of parallel partitions (default: CPU cores)
+/// - `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` — Enforce batch size in hash joins (default: true)
+/// - `POTATODB_COALESCE_BATCHES` — Coalesce small batches between operators (default: true)
 fn build_session_config() -> SessionConfig {
-    let parallelism = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4);
+    let parallelism = std::env::var("POTATODB_TARGET_PARTITIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(4)
+        });
+
+    let batch_size = std::env::var("POTATODB_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16384);
+
+    let write_batch_size = std::env::var("POTATODB_PARQUET_WRITE_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16384);
+
+    let enforce_batch_size_in_joins = std::env::var("POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => v.parse::<bool>().ok(),
+        })
+        .unwrap_or(true);
+
+    let coalesce_batches = std::env::var("POTATODB_COALESCE_BATCHES")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => v.parse::<bool>().ok(),
+        })
+        .unwrap_or(true);
 
     let mut config = SessionConfig::new()
         .with_information_schema(true)
-        .with_batch_size(8192)
-        .with_target_partitions(parallelism);
+        .with_batch_size(batch_size)
+        .with_target_partitions(parallelism)
+        .with_enforce_batch_size_in_joins(enforce_batch_size_in_joins)
+        .with_coalesce_batches(coalesce_batches);
 
     let parquet = &mut config.options_mut().execution.parquet;
 
@@ -369,7 +411,7 @@ fn build_session_config() -> SessionConfig {
     parquet.statistics_enabled = Some("page".to_string());
     parquet.bloom_filter_on_write = true;
     parquet.max_row_group_size = 1_048_576;
-    parquet.write_batch_size = 8192;
+    parquet.write_batch_size = write_batch_size;
     parquet.data_page_row_count_limit = 20_000;
 
     config

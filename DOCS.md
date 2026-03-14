@@ -288,10 +288,36 @@ All tuning knobs are set in `build_session_config()`:
 | `dictionary_enabled`          | `true`      | Dictionary-encode all columns                 |
 | `statistics_enabled`          | `page`      | Write min/max statistics per page             |
 | `max_row_group_size`          | `1,048,576` | Rows per row group                            |
-| `write_batch_size`            | `1,024`     | Internal write buffer size                    |
+| `write_batch_size`            | `8,192`     | Parquet write buffer size (env: `POTATODB_PARQUET_WRITE_BATCH_SIZE`) |
 | `data_page_row_count_limit`   | `20,000`    | Max rows per data page                        |
-| `batch_size`                  | `8,192`     | Arrow batch size during execution             |
-| `target_partitions`           | CPU cores   | Parallel scan / aggregation partitions        |
+| `batch_size`                  | `8,192`     | Arrow batch size (env: `POTATODB_BATCH_SIZE`) |
+| `target_partitions`           | CPU cores   | Parallel partitions (env: `POTATODB_TARGET_PARTITIONS`) |
+
+---
+
+## Profiling (macOS)
+
+On macOS, use `scripts/profile_sample.sh` to profile potatodb with the `sample` tool
+while running a SQL workload:
+
+```bash
+./scripts/profile_sample.sh sample_data.sql
+```
+
+Environment variables control sampling:
+
+| Variable             | Default | Purpose                              |
+|----------------------|---------|--------------------------------------|
+| `SAMPLE_INTERVAL_MS` | `1`     | Sampling interval in milliseconds    |
+| `SAMPLE_DURATION_SEC`| `10`    | Total sampling duration in seconds   |
+| `SAMPLE_OUTPUT`      | auto    | Output report file path              |
+| `DATA_DIR`           | `./potatodb_profile_data` | PotatoDB data directory     |
+
+Example with longer sampling:
+
+```bash
+SAMPLE_DURATION_SEC=30 SAMPLE_INTERVAL_MS=2 ./scripts/profile_sample.sh sample_data.sql
+```
 
 ---
 
@@ -466,6 +492,11 @@ A `CMakeLists.txt` is provided in `crates/ffi/` for CMake integration.
 | `POTATODB_QUERY_LOG_MAX` | `200` | In-memory recent-query log capacity |
 | `POTATODB_CDC_CAPACITY` | `2000` | Maximum CDC events kept in memory |
 | `POTATODB_SNAPSHOT_RETENTION_MS` | `86400000` | Snapshot retention window for time-travel queries |
+| `POTATODB_BATCH_SIZE` | `8192` | DataFusion Arrow batch size during execution |
+| `POTATODB_PARQUET_WRITE_BATCH_SIZE` | `8192` | Parquet write buffer size per batch |
+| `POTATODB_TARGET_PARTITIONS` | CPU cores | Number of parallel execution partitions |
+| `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` | `true` | Enforce batch size in hash joins (reduces memory churn) |
+| `POTATODB_COALESCE_BATCHES` | `true` | Coalesce small batches between operators |
 
 ### Server
 
