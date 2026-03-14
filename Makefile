@@ -1,8 +1,8 @@
-.PHONY: all help build check clippy clippy-pedantic fmt fmt-check clean test \
+.PHONY: all help build check clippy clippy-fix fmt fmt-check clean test \
        rust-test bench bench-html release run run-repl run-release doc ffi ffi-example ffi-test \
        python-test package
 
-all: fmt clippy-pedantic test clean build doc
+all: fmt clippy test build
 
 PYTHON ?= python
 PACKAGE_DIR ?= dist
@@ -18,7 +18,7 @@ help:
 	@echo "  release         Build all workspace crates in release mode"
 	@echo "  check           Run cargo check"
 	@echo "  clippy          Run standard clippy checks (warnings denied)"
-	@echo "  clippy-pedantic Run strict clippy checks"
+	@echo "  clippy-fix      Auto-fix clippy suggestions where possible"
 	@echo "  fmt             Format Rust code"
 	@echo "  fmt-check       Check Rust formatting"
 	@echo "  test            Run all test suites (Rust + FFI/C++)"
@@ -57,7 +57,7 @@ clippy:
 		-W clippy::perf -W clippy::style -W clippy::all -D warnings
 
 clippy-fix:
-	cargo clippy --workspace --fix -- -W clippy::all -W clippy::correctness \
+	cargo clippy --workspace --fix --allow-dirty -- -W clippy::all -W clippy::correctness \
 		-W clippy::complexity -W clippy::perf -W clippy::style -D warnings
 
 fmt:

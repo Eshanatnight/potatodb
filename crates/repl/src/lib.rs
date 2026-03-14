@@ -4,6 +4,8 @@
 //! Provides readline editing, persistent history, multi-line input
 //! (accumulates until a `;` terminator), and special backslash commands.
 
+use std::borrow::Cow;
+
 use chrono::Utc;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -16,6 +18,13 @@ use rustyline::{Context, Helper};
 
 use potatodb_display as display;
 use potatodb_engine::{PotatoDB, QueryResult};
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD_BLUE: &str = "\x1b[1;34m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
 
 /// ASCII art banner printed once at REPL startup.
 const BANNER: &str = r"
@@ -36,10 +45,39 @@ struct ReplHelper {
 }
 
 impl Helper for ReplHelper {}
-impl Highlighter for ReplHelper {}
 impl Validator for ReplHelper {}
 impl Hinter for ReplHelper {
     type Hint = String;
+}
+
+impl Highlighter for ReplHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if line.is_empty() || line.starts_with('\\') || line.starts_with('.') {
+            return Cow::Borrowed(line);
+        }
+        Cow::Owned(highlight_sql(line))
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        Cow::Owned(format!("{ANSI_BOLD_GREEN}{prompt}{ANSI_RESET}"))
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("{ANSI_DIM}{hint}{ANSI_RESET}"))
+    }
+
+    fn highlight_char(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _kind: rustyline::highlight::CmdKind,
+    ) -> bool {
+        true
+    }
 }
 
 impl Completer for ReplHelper {
@@ -218,10 +256,13 @@ async fn execute_and_print(db: &mut PotatoDB, sql: &str) {
     let start = Utc::now();
     match db.execute(sql).await {
         Ok(QueryResult::Records(batches)) => {
-            let rows = display::row_count(&batches);
             let elapsed = Utc::now() - start;
-            println!("({rows} row(s), {}ms)", elapsed.num_milliseconds());
-            println!("{}", display::format_batches(&batches));
+            println!("{}", display::format_batches_truncated(&batches));
+            println!(
+                "({} row(s), {}ms)",
+                display::row_count(&batches),
+                elapsed.num_milliseconds()
+            );
         }
         Ok(QueryResult::Message(msg)) => {
             let elapsed = Utc::now() - start;
@@ -243,9 +284,8 @@ async fn execute_file_and_print(db: &mut PotatoDB, path: &str) {
             for (stmt, result) in results {
                 match result {
                     Ok(QueryResult::Records(batches)) => {
-                        let rows = display::row_count(&batches);
-                        println!("{}", display::format_batches(&batches));
-                        println!("({rows} row(s))");
+                        println!("{}", display::format_batches_truncated(&batches));
+                        println!("({} row(s))", display::row_count(&batches));
                     }
                     Ok(QueryResult::Message(msg)) => {
                         println!("{msg}");
@@ -374,4 +414,132 @@ fn strip_line_comment(line: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// SQL syntax highlighting
+// ---------------------------------------------------------------------------
+
+fn highlight_sql(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    let mut chars = input.char_indices().peekable();
+
+    while let Some(&(i, ch)) = chars.peek() {
+        if ch == '\'' {
+            out.push_str(ANSI_GREEN);
+            out.push('\'');
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some((_, '\'')) => {
+                        out.push('\'');
+                        if chars.peek().map(|&(_, c)| c) == Some('\'') {
+                            out.push(chars.next().unwrap().1);
+                        } else {
+                            break;
+                        }
+                    }
+                    Some((_, c)) => out.push(c),
+                    None => break,
+                }
+            }
+            out.push_str(ANSI_RESET);
+            continue;
+        }
+
+        if ch == '-' && input[i..].starts_with("--") {
+            out.push_str(ANSI_DIM);
+            for (_, c) in chars.by_ref() {
+                out.push(c);
+            }
+            out.push_str(ANSI_RESET);
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            out.push_str(ANSI_CYAN);
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_ascii_digit() || c == '.' {
+                    out.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push_str(ANSI_RESET);
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = i;
+            chars.next();
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let end = chars.peek().map_or(input.len(), |&(e, _)| e);
+            let word = &input[start..end];
+            if is_sql_keyword(word) {
+                out.push_str(ANSI_BOLD_BLUE);
+                out.push_str(word);
+                out.push_str(ANSI_RESET);
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+
+        if ch == ';' {
+            out.push_str(ANSI_DIM);
+            out.push(';');
+            out.push_str(ANSI_RESET);
+            chars.next();
+            continue;
+        }
+
+        out.push(ch);
+        chars.next();
+    }
+
+    out
+}
+
+#[rustfmt::skip]
+fn is_sql_keyword(word: &str) -> bool {
+    let upper = word.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "ADD" | "ALL" | "ALTER" | "ANALYZE" | "AND" | "ANY" | "AS" | "ASC" | "AVG"
+        | "BEGIN" | "BETWEEN" | "BIGINT" | "BINARY" | "BLOB" | "BOOL" | "BOOLEAN" | "BY"
+        | "CASCADE" | "CASE" | "CAST" | "CHAR" | "CHECK" | "COALESCE" | "COLUMN"
+        | "COMMIT" | "CONFLICT" | "CONSTRAINT" | "COPY" | "COUNT" | "CREATE" | "CROSS"
+        | "CURRENT"
+        | "DATABASE" | "DATE" | "DECIMAL" | "DEFAULT" | "DELETE" | "DESC" | "DESCRIBE"
+        | "DISTINCT" | "DO" | "DOUBLE" | "DROP"
+        | "ELSE" | "END" | "EXCEPT" | "EXISTS" | "EXPLAIN"
+        | "FALSE" | "FETCH" | "FIRST" | "FLOAT" | "FOLLOWING" | "FOR" | "FOREIGN" | "FROM"
+        | "FULL"
+        | "GROUP"
+        | "HAVING"
+        | "IF" | "IGNORE" | "ILIKE" | "IN" | "INDEX" | "INNER" | "INSERT" | "INT"
+        | "INTEGER" | "INTERSECT" | "INTO" | "IS"
+        | "JOIN"
+        | "KEY"
+        | "LEFT" | "LIKE" | "LIMIT"
+        | "MATERIALIZED" | "MAX" | "MERGE" | "MIN"
+        | "NATURAL" | "NEXT" | "NOT" | "NOTHING" | "NULL" | "NULLIF" | "NULLS" | "NUMERIC"
+        | "OFFSET" | "ON" | "ONLY" | "OR" | "ORDER" | "OUTER" | "OVER"
+        | "PARTITION" | "PRECEDING" | "PRIMARY"
+        | "RANGE" | "REAL" | "RECURSIVE" | "REFERENCES" | "RELEASE" | "RENAME" | "REPLACE"
+        | "RESTRICT" | "RETURNING" | "RIGHT" | "ROLLBACK" | "ROW" | "ROWS"
+        | "SAVEPOINT" | "SCHEMA" | "SELECT" | "SERIAL" | "SET" | "SMALLINT" | "SOME" | "SUM"
+        | "TABLE" | "TEMP" | "TEMPORARY" | "TEXT" | "THEN" | "TIMESTAMP" | "TINYINT" | "TO"
+        | "TRUE" | "TRUNCATE" | "TYPE"
+        | "UNBOUNDED" | "UNION" | "UNIQUE" | "UPDATE" | "USING"
+        | "VACUUM" | "VALUES" | "VARCHAR" | "VIEW"
+        | "WHEN" | "WHERE" | "WINDOW" | "WITH"
+    )
 }

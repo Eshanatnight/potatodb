@@ -35,6 +35,10 @@ pub struct ArrowWal {
 
 impl ArrowWal {
     /// Opens (or creates) the Arrow WAL directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or read.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -45,6 +49,11 @@ impl ArrowWal {
     }
 
     /// Appends `batches` for `table` as a new Arrow IPC file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table directory cannot be created, the IPC file
+    /// cannot be written, or Arrow serialization fails.
     pub fn append(&mut self, table: &str, batches: &[RecordBatch]) -> io::Result<()> {
         if batches.is_empty() {
             return Ok(());
@@ -78,6 +87,11 @@ impl ArrowWal {
     /// Reads all Arrow IPC files and returns `RecordBatch`es grouped
     /// by table name.  Files are read in sorted order so that the
     /// original insertion order is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read or any Arrow IPC
+    /// file is invalid.
     pub fn recover(dir: impl AsRef<Path>) -> io::Result<HashMap<String, Vec<RecordBatch>>> {
         let dir = dir.as_ref();
         if !dir.exists() {
@@ -90,21 +104,16 @@ impl ArrowWal {
             .filter_map(Result::ok)
             .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
             .collect();
-        table_dirs.sort_by_key(|e| e.file_name());
+        table_dirs.sort_by_key(std::fs::DirEntry::file_name);
 
         for table_entry in table_dirs {
             let table_name = table_entry.file_name().to_string_lossy().to_string();
 
             let mut arrow_files: Vec<_> = fs::read_dir(table_entry.path())?
                 .filter_map(Result::ok)
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "arrow")
-                        .unwrap_or(false)
-                })
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "arrow"))
                 .collect();
-            arrow_files.sort_by_key(|e| e.file_name());
+            arrow_files.sort_by_key(std::fs::DirEntry::file_name);
 
             let batches = result.entry(table_name).or_default();
 
@@ -132,6 +141,10 @@ impl ArrowWal {
     }
 
     /// Removes all Arrow IPC files for `table`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table directory cannot be removed.
     pub fn checkpoint_table(&self, table: &str) -> io::Result<()> {
         let table_dir = self.dir.join(table);
         if table_dir.exists() {
@@ -141,6 +154,10 @@ impl ArrowWal {
     }
 
     /// Removes all Arrow IPC files for every table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any table directory cannot be read or removed.
     pub fn checkpoint_all(&self) -> io::Result<()> {
         if self.dir.exists() {
             for entry in fs::read_dir(&self.dir)? {

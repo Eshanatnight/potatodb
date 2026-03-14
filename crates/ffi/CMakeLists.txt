@@ -40,6 +40,15 @@ if(MSVC)
     target_link_libraries(potatodb_ffi INTERFACE
         ws2_32 userenv advapi32 bcrypt ntdll synchronization
     )
+elseif(APPLE)
+    # macOS: Rust staticlib uses rustls -> security-framework
+    target_link_libraries(potatodb_ffi INTERFACE
+        ${CMAKE_DL_LIBS}
+        m
+        "-framework Security"
+        "-framework CoreFoundation"
+        "-framework Foundation"
+    )
 else()
     target_link_libraries(potatodb_ffi INTERFACE
         ${CMAKE_DL_LIBS}   # -ldl

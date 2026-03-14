@@ -6,3 +6,4 @@ edition.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-cast.workspace = true

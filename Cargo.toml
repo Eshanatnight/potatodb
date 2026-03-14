@@ -21,6 +21,7 @@ edition = "2021"
 
 [workspace.dependencies]
 arrow = { version = "57", features = ["prettyprint"] }
+arrow-cast = { version = "57", features = ["prettyprint"] }
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
@@ -56,9 +57,8 @@ potatodb-http = { path = "crates/http" }
 opt-level = 3
 #lto = "fat"
 codegen-units = 1
-#strip = true
+strip = true
 panic = "abort"
-debug = 2
 
 [profile.release.build-override]
 opt-level = 3
