@@ -4,7 +4,7 @@
 
 all: fmt clippy test build
 
-PYTHON ?= python
+PYTHON ?= $(shell command -v python3 || command -v python)
 PACKAGE_DIR ?= dist
 PACKAGE_NAME ?= potatodb
 PACKAGE_VERSION ?=
