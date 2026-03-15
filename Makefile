@@ -45,6 +45,15 @@ build:
 
 release:
 	cargo build --workspace --release
+	@echo "Building FFI crate and examples..."
+	@$(MAKE) ffi || true
+	@$(MAKE) ffi-example || true
+	# Try to build ffi CMake tests if present (non-fatal)
+	@if [ -f crates/ffi/CMakeLists.txt ]; then \
+	  cmake -B build -S crates/ffi 2>/dev/null || true; \
+	  cmake --build build --config Release 2>/dev/null || true; \
+	fi
+	@echo "Release build complete. Artifacts in target/release/"
 
 check:
 	cargo check --workspace

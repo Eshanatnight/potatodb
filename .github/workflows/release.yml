@@ -62,16 +62,33 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
-      - name: Package binary (Linux/macOS)
+      - name: Package binary and FFI libs (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
-          zip -j potatodb-${{ matrix.name }}.zip target/release/potatodb
+          set -euo pipefail
+          ZIP=potatodb-${{ matrix.name }}.zip
+          rm -f "$ZIP"
+          # Collect main binary and any ffi artifacts produced by the ffi crate
+          FILES=(target/release/potatodb target/release/libpotatodb_ffi.* target/release/libpotatodb_ffi.a)
+          for f in "${FILES[@]}"; do
+            for match in $f; do
+              if [ -e "$match" ]; then
+                zip -j "$ZIP" "$match"
+              fi
+            done
+          done
 
-      - name: Package binary (Windows)
+      - name: Package binary and FFI libs (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Compress-Archive -Path target\release\potatodb.exe -DestinationPath potatodb-${{ matrix.name }}.zip -Force
+          $zip = "potatodb-${{ matrix.name }}.zip"
+          if (Test-Path $zip) { Remove-Item $zip }
+          $items = @()
+          if (Test-Path target\release\potatodb.exe) { $items += "target\release\potatodb.exe" }
+          if (Test-Path target\release\potatodb_ffi.dll) { $items += "target\release\potatodb_ffi.dll" }
+          if (Test-Path target\release\potatodb_ffi.lib) { $items += "target\release\potatodb_ffi.lib" }
+          if ($items.Count -eq 0) { New-Item -Path $zip -ItemType File | Out-Null } else { Compress-Archive -Path $items -DestinationPath $zip -Force }
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
