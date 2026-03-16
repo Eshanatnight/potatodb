@@ -47,8 +47,8 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Cargo test (workspace, all targets)
-        run: cargo test --workspace --all-targets --locked
+      - name: Test (workspace, all targets)
+        run: make test
 
   fmt:
     name: Rustfmt (format check)
