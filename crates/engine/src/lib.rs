@@ -32,6 +32,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -69,8 +70,9 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutPayload};
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType,
-    ExactNumberInfo, ObjectType, OnConflict, OnConflictAction, OnInsert, ReferentialAction,
-    SequenceOptions, Statement, TableConstraint as SqlTableConstraint, TimezoneInfo,
+    ExactNumberInfo, MergeAction, MergeClauseKind, MergeInsertKind, ObjectType, OnConflict,
+    OnConflictAction, OnInsert, ReferentialAction, SequenceOptions, Statement,
+    TableConstraint as SqlTableConstraint, TableFactor, TimezoneInfo,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -81,8 +83,8 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use potatodb_catalog::{
     Catalog, CatalogSnapshot, ColumnDef, ColumnStatistics, FileStats, IndexColumn, IndexDef,
-    SequenceDef, TableConstraint as CatalogTableConstraint, TableMeta, TableStatistics, UdfDef,
-    ViewDef,
+    SequenceDef, TableConstraint as CatalogTableConstraint, TableMeta, TableStatistics,
+    TriggerDef, UdfDef, ViewDef,
 };
 use potatodb_wal::{ArrowWal, EntryStatus, Wal, WalEntry};
 
@@ -223,6 +225,17 @@ struct Transaction {
     wal_txn_id: u64,
     /// In-memory backups for tables rewritten inside this transaction.
     rewrite_backups: HashMap<String, Vec<RecordBatch>>,
+    /// Named savepoints for partial rollback.
+    savepoints: Vec<Savepoint>,
+}
+
+/// State captured at a SAVEPOINT for ROLLBACK TO SAVEPOINT.
+#[derive(Clone)]
+struct Savepoint {
+    name: String,
+    catalog_snapshot: CatalogSnapshot,
+    file_snapshot: HashMap<String, HashSet<ObjPath>>,
+    rewrite_backups: HashMap<String, Vec<RecordBatch>>,
 }
 
 /// Buffered INSERT payload for a single table/column-shape.
@@ -289,6 +302,7 @@ pub struct PotatoDB {
     notification_queues: HashMap<String, VecDeque<String>>,
     cdc_log: VecDeque<CdcEvent>,
     cdc_capacity: usize,
+    cdc_log_path: Option<PathBuf>,
     current_user: String,
     snapshots: VecDeque<DbSnapshot>,
     snapshot_retention_ms: i64,
@@ -596,6 +610,11 @@ impl PotatoDB {
                 .insert(current_user.clone(), vec!["admin".to_string()]);
         }
 
+        let cdc_log_path = if is_s3 {
+            None
+        } else {
+            Some(PathBuf::from(&data_url_normalized).join("_cdc_log.jsonl"))
+        };
         let mut db = Self {
             ctx,
             catalog,
@@ -626,6 +645,7 @@ impl PotatoDB {
             notification_queues: HashMap::new(),
             cdc_log: VecDeque::new(),
             cdc_capacity,
+            cdc_log_path,
             current_user,
             snapshots: VecDeque::new(),
             snapshot_retention_ms,
@@ -636,6 +656,23 @@ impl PotatoDB {
             last_query_metrics: QueryMetrics::default(),
         };
         db.reload_tables().await?;
+        if let Some(path) = &db.cdc_log_path {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                for line in contents.lines() {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        db.cdc_log.push_back(CdcEvent {
+                            table: val["table"].as_str().unwrap_or("").to_string(),
+                            op: val["op"].as_str().unwrap_or("").to_string(),
+                            timestamp_ms: val["timestamp_ms"].as_i64().unwrap_or(0),
+                            rows: val["rows"].as_u64().unwrap_or(0) as usize,
+                        });
+                    }
+                }
+                while db.cdc_log.len() > db.cdc_capacity {
+                    let _ = db.cdc_log.pop_front();
+                }
+            }
+        }
         let _ = db.capture_snapshot().await;
 
         if !is_s3 {
@@ -1511,6 +1548,7 @@ impl PotatoDB {
             deferred_deletes: Vec::new(),
             wal_txn_id,
             rewrite_backups: HashMap::new(),
+            savepoints: Vec::new(),
         });
 
         Ok(QueryResult::Message("BEGIN".into()))
@@ -1616,6 +1654,134 @@ impl PotatoDB {
         Ok(QueryResult::Message("ROLLBACK".into()))
     }
 
+    /// `SAVEPOINT name` -- captures current state for partial rollback.
+    async fn handle_savepoint(&mut self, name: &str) -> Result<QueryResult, BoxError> {
+        let catalog_snapshot = self.catalog.snapshot();
+
+        let table_names: Vec<String> = self.catalog.tables.keys().cloned().collect();
+        let mut file_snapshot = HashMap::new();
+        for table_name in &table_names {
+            file_snapshot.insert(
+                table_name.clone(),
+                self.list_parquet_files(table_name).await?,
+            );
+        }
+
+        let rewrite_backups = self
+            .active_txn
+            .as_ref()
+            .map(|txn| txn.rewrite_backups.clone())
+            .unwrap_or_default();
+
+        let txn = self
+            .active_txn
+            .as_mut()
+            .ok_or("SAVEPOINT requires an active transaction")?;
+
+        txn.savepoints.push(Savepoint {
+            name: name.to_string(),
+            catalog_snapshot,
+            file_snapshot,
+            rewrite_backups,
+        });
+
+        Ok(QueryResult::Message(format!("SAVEPOINT {name}")))
+    }
+
+    /// `ROLLBACK TO [SAVEPOINT] name` -- restores state to the named savepoint.
+    async fn handle_rollback_to(&mut self, name: &str) -> Result<QueryResult, BoxError> {
+        let (catalog_snapshot, file_snapshot, rewrite_backups) = {
+            let txn = self
+                .active_txn
+                .as_mut()
+                .ok_or("ROLLBACK TO SAVEPOINT requires an active transaction")?;
+
+            let idx = txn
+                .savepoints
+                .iter()
+                .rposition(|sp| sp.name == name)
+                .ok_or_else(|| format!("Savepoint '{name}' does not exist"))?;
+
+            let catalog_snapshot = txn.savepoints[idx].catalog_snapshot.clone();
+            let file_snapshot = txn.savepoints[idx].file_snapshot.clone();
+            let rewrite_backups = txn.savepoints[idx].rewrite_backups.clone();
+            txn.savepoints.truncate(idx + 1);
+
+            (catalog_snapshot, file_snapshot, rewrite_backups)
+        };
+
+        let current_table_names: Vec<String> = self.catalog.tables.keys().cloned().collect();
+        let snapshot_table_names: HashSet<&String> = file_snapshot.keys().collect();
+
+        for (table_name, old_files) in &file_snapshot {
+            if let Ok(current_files) = self.list_parquet_files(table_name).await {
+                for f in &current_files {
+                    if !old_files.contains(f) {
+                        let _ = self.store.delete(f).await;
+                    }
+                }
+            }
+        }
+
+        for table_name in &current_table_names {
+            if !snapshot_table_names.contains(table_name) {
+                if let Some(meta) = self.catalog.tables.get(table_name) {
+                    let _ = self.delete_table_storage(meta).await;
+                }
+                let _ = self.ctx.deregister_table(table_name.as_str());
+            }
+        }
+
+        self.catalog.restore(catalog_snapshot);
+
+        for table_name in &current_table_names {
+            let _ = self.ctx.deregister_table(table_name.as_str());
+        }
+        self.reload_tables().await?;
+
+        for (table, batches) in rewrite_backups {
+            if let Some(meta) = self.catalog.tables.get(&table) {
+                let schema = columns_to_schema(&meta.columns)?;
+                self.rewrite_table(&table, schema, batches).await?;
+            }
+        }
+
+        let catalog_snapshot = self.catalog.snapshot();
+        let table_names: Vec<String> = self.catalog.tables.keys().cloned().collect();
+        let mut file_snapshot = HashMap::new();
+        for table_name in &table_names {
+            file_snapshot.insert(
+                table_name.clone(),
+                self.list_parquet_files(table_name).await?,
+            );
+        }
+
+        let txn = self.active_txn.as_mut().unwrap();
+        txn.catalog_snapshot = catalog_snapshot;
+        txn.file_snapshot = file_snapshot;
+        txn.rewrite_backups = HashMap::new();
+
+        Ok(QueryResult::Message(format!("ROLLBACK TO SAVEPOINT {name}")))
+    }
+
+    /// `RELEASE [SAVEPOINT] name` -- discards the named savepoint without restoring.
+    async fn handle_release_savepoint(&mut self, name: &str) -> Result<QueryResult, BoxError> {
+        let txn = self
+            .active_txn
+            .as_mut()
+            .ok_or("RELEASE SAVEPOINT requires an active transaction")?;
+
+        let idx = txn
+            .savepoints
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| format!("Savepoint '{name}' does not exist"))?;
+
+        txn.savepoints.truncate(idx);
+
+        Ok(QueryResult::Message(format!("RELEASE SAVEPOINT {name}")))
+    }
+
     // ── SQL file execution ─────────────────────────────────────
 
     /// Reads a `.sql` file, splits it into individual statements on
@@ -1659,6 +1825,7 @@ impl PotatoDB {
     /// # Errors
     ///
     /// Returns an error if the SQL is invalid or execution fails.
+    #[async_recursion::async_recursion]
     pub async fn execute(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         self.last_query_metrics = QueryMetrics::default();
         let started_at = Instant::now();
@@ -1791,6 +1958,40 @@ impl PotatoDB {
         if upper.starts_with("CREATE FULLTEXT INDEX ") {
             let result = self.handle_create_fulltext_index(trimmed);
             self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("CREATE TRIGGER ") {
+            let result = self.handle_create_trigger(trimmed).await;
+            self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("DROP TRIGGER ") {
+            let result = self.handle_drop_trigger(trimmed).await;
+            self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("SAVEPOINT ") {
+            let name = trimmed["SAVEPOINT ".len()..].trim().trim_matches('"');
+            let result = self.handle_savepoint(name).await;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("ROLLBACK TO ") {
+            let rest = trimmed["ROLLBACK TO ".len()..].trim();
+            let name = rest
+                .strip_prefix("SAVEPOINT ")
+                .unwrap_or(rest)
+                .trim()
+                .trim_matches('"');
+            let result = self.handle_rollback_to(name).await;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
+            let name = if upper.starts_with("RELEASE SAVEPOINT ") {
+                trimmed["RELEASE SAVEPOINT ".len()..].trim().trim_matches('"')
+            } else {
+                trimmed["RELEASE ".len()..].trim().trim_matches('"')
+            };
+            let result = self.handle_release_savepoint(name).await;
             return self.finalize_query(sql, started_at, result);
         }
 
@@ -1939,6 +2140,13 @@ impl PotatoDB {
                     .await
             }
             Statement::Insert(insert) => self.handle_insert(sql, insert).await,
+            Statement::Merge {
+                ref table,
+                ref source,
+                ref on,
+                ref clauses,
+                ..
+            } => self.handle_merge(table, source, on, clauses).await,
             Statement::AlterTable {
                 ref name,
                 ref operations,
@@ -2015,6 +2223,7 @@ impl PotatoDB {
                 | Statement::Insert(_)
                 | Statement::Delete(_)
                 | Statement::Update { .. }
+                | Statement::Merge { .. }
                 | Statement::AlterTable { .. }
                 | Statement::CreateView { .. }
                 | Statement::Drop {
@@ -2032,6 +2241,7 @@ impl PotatoDB {
             Statement::CreateTable(_)
                 | Statement::CreateIndex(_)
                 | Statement::CreateSequence { .. }
+                | Statement::Merge { .. }
                 | Statement::AlterTable { .. }
                 | Statement::CreateView { .. }
                 | Statement::Drop {
@@ -2317,14 +2527,30 @@ impl PotatoDB {
     }
 
     fn record_cdc_event(&mut self, table: &str, op: &str, rows: usize) {
+        let timestamp_ms = Utc::now().timestamp_millis();
         self.cdc_log.push_back(CdcEvent {
             table: table.to_string(),
             op: op.to_string(),
-            timestamp_ms: Utc::now().timestamp_millis(),
+            timestamp_ms,
             rows,
         });
         while self.cdc_log.len() > self.cdc_capacity {
             let _ = self.cdc_log.pop_front();
+        }
+        if let Some(path) = &self.cdc_log_path {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let line = serde_json::json!({
+                    "table": table,
+                    "op": op,
+                    "timestamp_ms": timestamp_ms,
+                    "rows": rows
+                });
+                let _ = writeln!(f, "{}", line);
+            }
         }
     }
 
@@ -2489,6 +2715,72 @@ impl PotatoDB {
             extract_dollar_quoted_body(trimmed).ok_or("CREATE PROCEDURE requires $$...$$")?;
         self.procedures.insert(name.clone(), body);
         Ok(QueryResult::Message(format!("Procedure '{name}' created.")))
+    }
+
+    async fn handle_create_trigger(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        let trimmed = sql.trim().trim_end_matches(';');
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("CREATE TRIGGER ") {
+            return Err("Expected CREATE TRIGGER".into());
+        }
+        let after = trimmed["CREATE TRIGGER ".len()..].trim();
+        let name_end = after
+            .find(|c: char| c.is_whitespace())
+            .ok_or("CREATE TRIGGER requires trigger name")?;
+        let name = after[..name_end].trim_matches('"').to_string();
+        let rest = after[name_end..].trim();
+        let timing = if rest.to_uppercase().starts_with("BEFORE ") {
+            "BEFORE"
+        } else if rest.to_uppercase().starts_with("AFTER ") {
+            "AFTER"
+        } else {
+            return Err("CREATE TRIGGER requires BEFORE or AFTER".into());
+        };
+        let after_timing = rest[6..].trim();
+        let event = if after_timing.to_uppercase().starts_with("INSERT ") {
+            "INSERT"
+        } else if after_timing.to_uppercase().starts_with("UPDATE ") {
+            "UPDATE"
+        } else if after_timing.to_uppercase().starts_with("DELETE ") {
+            "DELETE"
+        } else {
+            return Err("CREATE TRIGGER requires INSERT, UPDATE, or DELETE".into());
+        };
+        let after_event = after_timing[event.len()..].trim();
+        let on_idx = find_ci(after_event, " ON ").ok_or("CREATE TRIGGER requires ON")?;
+        let table_part = after_event[on_idx + 4..].trim();
+        let exec_idx =
+            find_ci(table_part, " EXECUTE ").ok_or("CREATE TRIGGER requires EXECUTE")?;
+        let table = table_part[..exec_idx].trim().trim_matches('"').to_string();
+        let body =
+            extract_dollar_quoted_body(trimmed).ok_or("CREATE TRIGGER requires $$...$$ body")?;
+        let def = TriggerDef {
+            name: name.clone(),
+            table,
+            event: event.to_string(),
+            timing: timing.to_string(),
+            body,
+        };
+        self.catalog.triggers.insert(name.clone(), def);
+        self.catalog.save().await?;
+        Ok(QueryResult::Message(format!("Trigger '{name}' created.")))
+    }
+
+    async fn handle_drop_trigger(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        let trimmed = sql.trim().trim_end_matches(';');
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("DROP TRIGGER ") {
+            return Err("Expected DROP TRIGGER".into());
+        }
+        let name = trimmed["DROP TRIGGER ".len()..]
+            .split_whitespace()
+            .next()
+            .ok_or("DROP TRIGGER requires trigger name")?
+            .trim_matches('"')
+            .to_string();
+        self.catalog.triggers.remove(&name);
+        self.catalog.save().await?;
+        Ok(QueryResult::Message(format!("Trigger '{name}' dropped.")))
     }
 
     fn handle_call_procedure<'a>(
@@ -3240,6 +3532,18 @@ impl PotatoDB {
         delete: &sqlparser::ast::Delete,
     ) -> Result<QueryResult, BoxError> {
         let table_name = extract_delete_table_name(delete)?;
+        let before_triggers: Vec<String> = self
+            .catalog
+            .triggers
+            .values()
+            .filter(|t| {
+                t.table == table_name && t.event == "DELETE" && t.timing == "BEFORE"
+            })
+            .map(|t| t.body.clone())
+            .collect();
+        for body in before_triggers {
+            let _ = self.execute(&body).await;
+        }
         let returning_clause = extract_returning_clause(sql);
 
         if !self.catalog.tables.contains_key(&table_name) {
@@ -3398,6 +3702,19 @@ impl PotatoDB {
         self.rewrite_table(&table_name, schema, surviving).await?;
         self.record_cdc_event(&table_name, "DELETE", deleted);
 
+        let after_triggers: Vec<String> = self
+            .catalog
+            .triggers
+            .values()
+            .filter(|t| {
+                t.table == table_name && t.event == "DELETE" && t.timing == "AFTER"
+            })
+            .map(|t| t.body.clone())
+            .collect();
+        for body in after_triggers {
+            let _ = self.execute(&body).await;
+        }
+
         if let Some(batches) = returning_batches {
             Ok(QueryResult::Records(batches))
         } else {
@@ -3417,6 +3734,18 @@ impl PotatoDB {
         selection: Option<&sqlparser::ast::Expr>,
     ) -> Result<QueryResult, BoxError> {
         let table_name = table.relation.to_string();
+        let before_triggers: Vec<String> = self
+            .catalog
+            .triggers
+            .values()
+            .filter(|t| {
+                t.table == table_name && t.event == "UPDATE" && t.timing == "BEFORE"
+            })
+            .map(|t| t.body.clone())
+            .collect();
+        for body in before_triggers {
+            let _ = self.execute(&body).await;
+        }
         let table_meta = self
             .catalog
             .tables
@@ -3490,6 +3819,123 @@ impl PotatoDB {
         } else {
             Ok(QueryResult::Message(format!("{updated} row(s) updated.")))
         }
+    }
+
+    /// Handles `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...`.
+    /// Delegates to UPDATE and INSERT by building equivalent SQL and calling execute().
+    async fn handle_merge(
+        &mut self,
+        table: &TableFactor,
+        source: &TableFactor,
+        on: &sqlparser::ast::Expr,
+        clauses: &[sqlparser::ast::MergeClause],
+    ) -> Result<QueryResult, BoxError> {
+        let target_str = table.to_string();
+        let source_str = source.to_string();
+        let on_str = on.to_string();
+
+        if !matches!(table, TableFactor::Table { .. }) {
+            return Err("MERGE target must be a table".into());
+        }
+
+        let mut total_updated = 0_i64;
+        let mut total_inserted = 0_i64;
+
+        for clause in clauses {
+            let predicate_str = clause
+                .predicate
+                .as_ref()
+                .map(|p| format!(" AND ({})", p))
+                .unwrap_or_default();
+
+            match (&clause.clause_kind, &clause.action) {
+                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
+                    let set_parts: Vec<String> = assignments
+                        .iter()
+                        .map(|a| format!("{} = {}", a.target, a.value))
+                        .collect();
+                    let set_clause = set_parts.join(", ");
+                    let update_sql = format!(
+                        "UPDATE {} SET {} FROM {} WHERE ({}){predicate_str}",
+                        target_str, set_clause, source_str, on_str
+                    );
+                    let result = self.execute(&update_sql).await?;
+                    if let QueryResult::Message(msg) = result {
+                        if let Some(n) = msg.split_whitespace().next().and_then(|s| s.parse::<i64>().ok()) {
+                            total_updated += n;
+                        }
+                    }
+                }
+                (MergeClauseKind::Matched, MergeAction::Delete) => {
+                    let delete_sql = format!(
+                        "DELETE FROM {} WHERE EXISTS (SELECT 1 FROM {} WHERE ({})){predicate_str}",
+                        target_str, source_str, on_str
+                    );
+                    let _ = self.execute(&delete_sql).await?;
+                }
+                (MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget, MergeAction::Insert(insert_expr)) => {
+                    let (cols, select_list) = match &insert_expr.kind {
+                        MergeInsertKind::Row => {
+                            let cols = if insert_expr.columns.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " ({})",
+                                    insert_expr
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
+                            (cols, "*".to_string())
+                        }
+                        MergeInsertKind::Values(values) => {
+                            let cols = if insert_expr.columns.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " ({})",
+                                    insert_expr
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
+                            let select_list = values
+                                .rows
+                                .first()
+                                .map(|row| {
+                                    row.iter()
+                                        .map(|e| e.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_else(|| "*".to_string());
+                            (cols, select_list)
+                        }
+                    };
+                    let insert_sql = format!(
+                        "INSERT INTO {target_str}{cols} SELECT {select_list} FROM {source_str} WHERE NOT EXISTS (SELECT 1 FROM {target_str} WHERE {on_str}){predicate_str}"
+                    );
+                    let result = self.execute(&insert_sql).await?;
+                    if let QueryResult::Message(msg) = result {
+                        if let Some(n) = msg.split_whitespace().next().and_then(|s| s.parse::<i64>().ok()) {
+                            total_inserted += n;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(QueryResult::Message(format!(
+            "{} row(s) updated, {} row(s) inserted.",
+            total_updated, total_inserted
+        )))
     }
 
     // ── ALTER TABLE ────────────────────────────────────────────
@@ -3805,6 +4251,18 @@ impl PotatoDB {
         }
 
         let table_name = insert.table.to_string();
+        let before_triggers: Vec<String> = self
+            .catalog
+            .triggers
+            .values()
+            .filter(|t| {
+                t.table == table_name && t.event == "INSERT" && t.timing == "BEFORE"
+            })
+            .map(|t| t.body.clone())
+            .collect();
+        for body in before_triggers {
+            let _ = self.execute(&body).await;
+        }
         let table_meta = self
             .catalog
             .tables
@@ -3857,6 +4315,19 @@ impl PotatoDB {
             self.refresh_table_file_stats_light(&table_name).await?;
             self.record_cdc_event(&table_name, "INSERT", inserted_rows);
 
+            let after_triggers: Vec<String> = self
+                .catalog
+                .triggers
+                .values()
+                .filter(|t| {
+                    t.table == table_name && t.event == "INSERT" && t.timing == "AFTER"
+                })
+                .map(|t| t.body.clone())
+                .collect();
+            for body in after_triggers {
+                let _ = self.execute(&body).await;
+            }
+
             let out = if let Some(ret) = &returning_clause {
                 let ret_sql = format!("SELECT {ret} FROM \"{table_name}\"");
                 self.ctx.sql(&ret_sql).await?.collect().await?
@@ -3883,6 +4354,20 @@ impl PotatoDB {
             .buffer_insert_batches(&table_name, columns, batches)
             .await?;
         self.record_cdc_event(&table_name, "INSERT", rows);
+
+        let after_triggers: Vec<String> = self
+            .catalog
+            .triggers
+            .values()
+            .filter(|t| {
+                t.table == table_name && t.event == "INSERT" && t.timing == "AFTER"
+            })
+            .map(|t| t.body.clone())
+            .collect();
+        for body in after_triggers {
+            let _ = self.execute(&body).await;
+        }
+
         Ok(QueryResult::Message(if flushed {
             format!("{rows} row(s) inserted into '{table_name}' (buffer flushed).")
         } else {
@@ -5111,6 +5596,7 @@ fn extract_mutated_table(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::Insert(ins) => Some(ins.table.to_string()),
         Statement::Update { table, .. } => Some(table.relation.to_string()),
+        Statement::Merge { table, .. } => Some(table.to_string()),
         Statement::Delete(del) => match &del.from {
             sqlparser::ast::FromTable::WithFromKeyword(tables)
             | sqlparser::ast::FromTable::WithoutKeyword(tables) => {

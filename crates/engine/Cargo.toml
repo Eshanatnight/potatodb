@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-recursion.workspace = true
 potatodb-catalog.workspace = true
 potatodb-wal.workspace = true
 async-trait.workspace = true

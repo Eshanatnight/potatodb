@@ -55,6 +55,7 @@ use potatodb_engine::{PotatoDB, QueryResult};
 struct Processor {
     db: Arc<RwLock<PotatoDB>>,
     query_parser: Arc<NoopQueryParser>,
+    max_connections: Arc<tokio::sync::Semaphore>,
 }
 
 type StartupAuthHandler =
@@ -91,6 +92,11 @@ impl Processor {
         &self,
         query: &str,
     ) -> Result<QueryResult, Box<dyn std::error::Error + Send + Sync>> {
+        let _permit = self
+            .max_connections
+            .acquire()
+            .await
+            .map_err(|e| format!("Connection pool closed: {e}"))?;
         if is_read_only_query(query) {
             let mut db = self.db.write().await;
             db.execute_readonly(query).await
@@ -414,9 +420,14 @@ pub async fn start_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = PotatoDB::new(data_url.to_string(), None).await?;
     let shared_db = Arc::new(RwLock::new(db));
+    let max_conn = std::env::var("POTATODB_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
     let processor = Arc::new(Processor {
         db: shared_db,
         query_parser: Arc::new(NoopQueryParser::new()),
+        max_connections: Arc::new(tokio::sync::Semaphore::new(max_conn)),
     });
     let startup = Arc::new(StartupAuthHandler::new(
         Arc::new(EnvAuthSource),

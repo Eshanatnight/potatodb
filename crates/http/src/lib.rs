@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,7 @@ fn build_router(db: Arc<RwLock<PotatoDB>>) -> Router {
     let state = AppState { db };
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/tables", get(list_tables))
         .route("/tables/{name}/stats", get(table_stats))
         .route("/query", post(run_query))
@@ -62,6 +65,47 @@ fn build_router(db: Arc<RwLock<PotatoDB>>) -> Router {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let db = state.db.read().await;
+    let tables_total = db.table_names().len();
+    let indexes_total = db.indexes().len();
+    let views_total = db.view_names().len();
+    let sequences_total = db.sequence_names().len();
+    let functions_total = db.function_names().len();
+    let users_total = db.user_info().len();
+
+    let body = format!(
+        r#"# HELP potatodb_tables_total Number of tables
+# TYPE potatodb_tables_total gauge
+potatodb_tables_total {tables_total}
+# HELP potatodb_indexes_total Number of indexes
+# TYPE potatodb_indexes_total gauge
+potatodb_indexes_total {indexes_total}
+# HELP potatodb_views_total Number of views
+# TYPE potatodb_views_total gauge
+potatodb_views_total {views_total}
+# HELP potatodb_sequences_total Number of sequences
+# TYPE potatodb_sequences_total gauge
+potatodb_sequences_total {sequences_total}
+# HELP potatodb_functions_total Number of user-defined functions
+# TYPE potatodb_functions_total gauge
+potatodb_functions_total {functions_total}
+# HELP potatodb_users_total Number of users
+# TYPE potatodb_users_total gauge
+potatodb_users_total {users_total}
+"#
+    );
+
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        body,
+    )
 }
 
 async fn list_tables(State(state): State<AppState>) -> Json<Vec<String>> {
