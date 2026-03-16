@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long)]
     s3_allow_http: bool,
 
+    /// Local directory for write-ahead logs (optional)
+    #[arg(long)]
+    wal_dir: Option<String>,
+
     /// Use the line-mode REPL instead of the TUI
     #[arg(long)]
     repl: bool,
@@ -55,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             endpoint: cli.s3_endpoint,
             region: Some(cli.s3_region),
             allow_http: cli.s3_allow_http,
+            wal_dir: cli.wal_dir,
         })
     } else {
         None
