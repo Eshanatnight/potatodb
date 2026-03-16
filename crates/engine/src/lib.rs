@@ -129,6 +129,15 @@ pub struct QueryLogEntry {
     pub rows: usize,
 }
 
+/// Per-query I/O metrics collected during execution.
+#[derive(Debug, Clone, Default)]
+pub struct QueryMetrics {
+    /// Number of Parquet files opened during the query.
+    pub parquet_files_read: usize,
+    /// Approximate bytes scanned from Parquet.
+    pub bytes_scanned: u64,
+}
+
 #[derive(Debug, Clone)]
 struct CdcEvent {
     table: String,
@@ -297,6 +306,8 @@ pub struct PotatoDB {
     /// automatic compaction (similar to VACUUM) is triggered after
     /// flush.  Set to 0 to disable.
     auto_compact_file_threshold: usize,
+    /// I/O metrics from the last executed query.
+    last_query_metrics: QueryMetrics,
 }
 
 /// Returns the Parquet compression setting from `POTATODB_PARQUET_COMPRESSION`,
@@ -612,6 +623,7 @@ impl PotatoDB {
             s3_wal_path,
             s3_wal_entries,
             auto_compact_file_threshold: 20,
+            last_query_metrics: QueryMetrics::default(),
         };
         db.reload_tables().await?;
         let _ = db.capture_snapshot().await;
@@ -715,6 +727,12 @@ impl PotatoDB {
                 (u.clone(), roles)
             })
             .collect()
+    }
+
+    /// Returns the I/O metrics from the last executed query.
+    #[must_use]
+    pub fn last_query_metrics(&self) -> &QueryMetrics {
+        &self.last_query_metrics
     }
 
     /// Returns the number of parquet files currently backing a table.
@@ -1630,6 +1648,7 @@ impl PotatoDB {
     ///
     /// Returns an error if the SQL is invalid or execution fails.
     pub async fn execute(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        self.last_query_metrics = QueryMetrics::default();
         let started_at = Instant::now();
         let mut effective_sql = self.expand_nextval_calls(sql).await?;
         if let Some(ts) = parse_as_of_timestamp(&effective_sql) {
@@ -5772,9 +5791,15 @@ fn normalize_explain_sql(sql: &str) -> String {
         let close_idx = trimmed.find(')');
         if let (Some(open), Some(close)) = (open_idx, close_idx) {
             if close > open {
+                let opts = upper[open + 1..close].trim();
+                let has_analyze = opts.split(',').any(|o| o.trim() == "ANALYZE");
                 let rest = trimmed[close + 1..].trim();
                 if !rest.is_empty() {
-                    return format!("EXPLAIN {rest}");
+                    return if has_analyze {
+                        format!("EXPLAIN ANALYZE {rest}")
+                    } else {
+                        format!("EXPLAIN {rest}")
+                    };
                 }
             }
         }
