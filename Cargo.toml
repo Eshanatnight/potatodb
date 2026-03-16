@@ -67,14 +67,15 @@ panic = "abort"
 opt-level = 3
 
 # Custom profile for profiling runs. Use with `cargo build --profile profiling`.
-# [profile.profiling]
-# opt-level = 3
-# codegen-units = 1
-# # Keep debug info for symbol resolution in profilers
-# debug = 2
-# # Do not strip symbols so profilers can map addresses
-# strip = false
-# panic = "abort"
+[profile.profiling]
+opt-level = 3
+codegen-units = 1
+# Keep debug info for symbol resolution in profilers
+debug = 2
+# Do not strip symbols so profilers can map addresses
+strip = false
+panic = "abort"
+inherits = "release"
 
 [profile.profiling.build-override]
 opt-level = 3
