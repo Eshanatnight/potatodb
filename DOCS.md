@@ -10,14 +10,26 @@ Recent engine extensions include:
 
 - additional SQL types (`UUID`, `INTERVAL`, `ARRAY`, `JSON/JSONB`)
 - user-defined SQL functions (`CREATE FUNCTION` / `DROP FUNCTION`)
-- destructive rewrite operations enabled inside transactions
+- transactions (`BEGIN`, `COMMIT`, `ROLLBACK`) with destructive rewrites, plus `SAVEPOINT`/ `ROLLBACK TO` / `RELEASE SAVEPOINT`
 - snapshot-based time-travel reads (`AS OF TIMESTAMP`)
 - foreign-key constraints with `RESTRICT` / `CASCADE` / `SET NULL`
-- CDC virtual table (`potatodb_cdc`)
+- CDC virtual table (`potatodb_cdc`) with durable disk persistence
 - `LISTEN` / `NOTIFY`
 - procedure support (`CREATE PROCEDURE`, `CALL`, `DO $$...$$`)
 - full-text index metadata with `fts_match(...)` rewrite
 - HTTP API crate (`potatodb-http`) and TLS-enabled pgwire server
+ - WebSocket support and a new `crates/nodejs` integration crate
+ - deletion vectors and partitioning (improved storage layouts)
+ - S3-backed WAL support and durable CDC improvements
+ - plan cache and query metrics (`QueryMetrics`) with EXPLAIN ANALYZE passthrough
+ - compaction and background maintenance (automatic file rewrites)
+ - PL/pgSQL compatibility, triggers, and `MERGE` support; built-ins like `generate_series`
+ - Prometheus metrics for observability and connection pooling support
+
+Observability: the engine now exports Prometheus metrics and collects per-query
+`QueryMetrics` (used by `EXPLAIN ANALYZE` passthrough and runtime telemetry).
+ - persisted RBAC (roles/privileges) stored in the catalog
+ - additional TUI meta-commands (`\\dt`, `\\di`, `\\dv`, `\\d`, `\\ds`, `\\df`, `\\du`)
 
 ---
 
@@ -116,6 +128,9 @@ trait, so the same code path works for both local files and S3.
   }
 }
 ```
+
+The catalog also stores RBAC role definitions and grants so role state (roles, memberships,
+and object privileges) is persisted and reloaded on startup.
 
 ### Legacy migration
 

@@ -17,6 +17,12 @@ A Parquet-backed SQL database written in Rust, powered by [Apache DataFusion](ht
 - **Integrity features** -- `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `FOREIGN KEY` with `RESTRICT` / `CASCADE` / `SET NULL`
 - **Operational tooling** -- CDC stream (`potatodb_cdc`), `LISTEN`/`NOTIFY`, auto-vacuum, retention policies, plan cache
 - **Multi-interface access** -- TUI, REPL, pgwire server (TLS-capable), C/C++ FFI, Python bindings, and HTTP API
+ - **Operational tooling** -- CDC stream (`potatodb_cdc`), durable CDC persistence, `LISTEN`/`NOTIFY`, auto-vacuum, retention policies, plan cache, compaction/background maintenance
+ - **Durability & storage** -- deletion vectors, partitioning for large tables, and S3-backed WAL replay for crash recovery
+ - **Observability & telemetry** -- Prometheus metrics, per-query `QueryMetrics`, and `EXPLAIN ANALYZE` passthrough for end-to-end timings
+ - **Programmability & SQL extensions** -- PL/pgSQL-style procedures, triggers, `MERGE`, and built-ins like `generate_series`
+ - **Security & multi-tenancy** -- persisted RBAC (roles/grants persisted in the catalog) and connection pooling support
+ - **Interfaces** -- WebSocket support and an experimental `crates/nodejs` integration crate; TUI includes additional meta-commands (`\dt`, `\di`, `\dv`, `\d`, `\ds`, `\df`, `\du`)
 
 ## Quick start
 
