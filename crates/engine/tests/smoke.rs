@@ -767,6 +767,37 @@ async fn test_vacuum_compacts_files() {
     }
 }
 
+#[tokio::test]
+async fn test_vacuum_analyze() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE t (id INT, name VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+        .await
+        .unwrap();
+
+    match db.execute("VACUUM ANALYZE t;").await.unwrap() {
+        QueryResult::Message(msg) => {
+            assert!(msg.contains("compacted"), "got: {msg}");
+            assert!(msg.contains("statistics"), "got: {msg}");
+        }
+        _ => panic!("expected message"),
+    }
+
+    match db.execute("SELECT COUNT(*) AS n FROM t;").await.unwrap() {
+        QueryResult::Records(batches) => {
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total, 1, "COUNT should still return one row");
+        }
+        _ => panic!("expected records"),
+    }
+}
+
 // ── ANALYZE tests ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -2847,4 +2878,104 @@ async fn test_fulltext_procedure_do_cdc_and_notifications() {
         }
         _ => panic!("expected records"),
     }
+}
+
+#[tokio::test]
+async fn test_generate_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    match db
+        .execute("SELECT * FROM generate_series(1, 5);")
+        .await
+        .unwrap()
+    {
+        QueryResult::Records(batches) => {
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total, 5, "expected 5 rows from generate_series(1,5)");
+            let col = batches[0].column(0);
+            let vals = col
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            for (i, v) in (1..=5).enumerate() {
+                assert_eq!(vals.value(i), v as i64);
+            }
+        }
+        _ => panic!("expected records from generate_series"),
+    }
+
+    // With step
+    match db
+        .execute("SELECT * FROM generate_series(0, 10, 2);")
+        .await
+        .unwrap()
+    {
+        QueryResult::Records(batches) => {
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total, 6, "expected 6 rows from generate_series(0,10,2)");
+        }
+        _ => panic!("expected records"),
+    }
+}
+
+#[tokio::test]
+async fn test_do_block_declare_and_variables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE do_test (id INT, msg VARCHAR);")
+        .await
+        .unwrap();
+
+    // DO block with DECLARE and variable substitution
+    db.execute(
+        r#"DO $$
+        DECLARE
+            n INT := 42;
+            s VARCHAR := 'hello';
+        BEGIN
+            INSERT INTO do_test VALUES (n, s);
+            INSERT INTO do_test VALUES (1, 'world');
+        END;
+        $$;"#,
+    )
+    .await
+    .unwrap();
+
+    match db
+        .execute("SELECT id, msg FROM do_test ORDER BY id;")
+        .await
+        .unwrap()
+    {
+        QueryResult::Records(batches) => {
+            assert_eq!(batches[0].num_rows(), 2);
+            let ids = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let msgs = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(ids.value(0), 1);
+            assert_eq!(msgs.value(0), "world");
+            assert_eq!(ids.value(1), 42);
+            assert_eq!(msgs.value(1), "hello");
+        }
+        _ => panic!("expected records"),
+    }
+
+    // RAISE NOTICE is a no-op
+    db.execute(
+        r#"DO $$ BEGIN RAISE NOTICE 'test message'; END; $$;"#,
+    )
+    .await
+    .unwrap();
 }

@@ -71,8 +71,8 @@ use object_store::{ObjectStore, PutPayload};
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType,
     ExactNumberInfo, MergeAction, MergeClauseKind, MergeInsertKind, ObjectType, OnConflict,
-    OnConflictAction, OnInsert, ReferentialAction, SequenceOptions, Statement,
-    TableConstraint as SqlTableConstraint, TableFactor, TimezoneInfo,
+    OnConflictAction, OnInsert, ReferentialAction, SequenceOptions, SetExpr, Statement,
+    TableConstraint as SqlTableConstraint, TableFactor, TableWithJoins, TimezoneInfo,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -297,6 +297,8 @@ pub struct PotatoDB {
     auto_analyze_threshold_rows: usize,
     /// Logical-plan cache for repeated read-only SQL text.
     plan_cache: HashMap<String, LogicalPlan>,
+    /// Number of times a cached plan was reused (plan cache hits).
+    plan_cache_hits: u64,
     procedures: HashMap<String, String>,
     fulltext_indexes: HashMap<String, FulltextIndexDef>,
     notification_queues: HashMap<String, VecDeque<String>>,
@@ -456,6 +458,10 @@ impl PotatoDB {
         let config = build_session_config();
         let ctx = SessionContext::new_with_config(config);
 
+        // Ensure generate_series table function is available (PostgreSQL-compatible)
+        let gs = datafusion::functions_table::generate_series();
+        ctx.register_udtf("generate_series", Arc::clone(gs.function()));
+
         let (store, is_s3, s3_prefix, data_url_normalized) = if data_url.starts_with("s3://") {
             let parsed = Url::parse(&data_url)?;
             let bucket = parsed
@@ -533,7 +539,11 @@ impl PotatoDB {
             let loaded_entries = match store.get(&path).await {
                 Ok(result) => {
                     let bytes = result.bytes().await?;
-                    serde_json::from_slice::<Vec<WalEntry>>(&bytes).unwrap_or_default()
+                    let s = String::from_utf8_lossy(&bytes);
+                    s.lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .filter_map(|l| serde_json::from_str::<WalEntry>(l).ok())
+                        .collect()
                 }
                 Err(object_store::Error::NotFound { .. }) => Vec::new(),
                 Err(e) => return Err(e.into()),
@@ -640,6 +650,7 @@ impl PotatoDB {
             rows_since_analyze: HashMap::new(),
             auto_analyze_threshold_rows,
             plan_cache: HashMap::new(),
+            plan_cache_hits: 0,
             procedures: HashMap::new(),
             fulltext_indexes: HashMap::new(),
             notification_queues: HashMap::new(),
@@ -782,6 +793,24 @@ impl PotatoDB {
     #[must_use]
     pub fn last_query_metrics(&self) -> &QueryMetrics {
         &self.last_query_metrics
+    }
+
+    /// Returns plan cache statistics: `(cached_plan_count, cache_hit_count)`.
+    #[must_use]
+    pub fn plan_cache_stats(&self) -> (usize, u64) {
+        (self.plan_cache.len(), self.plan_cache_hits)
+    }
+
+    /// Returns the number of deletion vectors for a table.
+    ///
+    /// Used to determine if compaction is needed for future incremental DML.
+    #[must_use]
+    pub fn deletion_vector_count(&self, table: &str) -> usize {
+        self.catalog
+            .tables
+            .get(table)
+            .map(|m| m.deletion_vectors.len())
+            .unwrap_or(0)
     }
 
     /// Returns the number of parquet files currently backing a table.
@@ -980,8 +1009,12 @@ impl PotatoDB {
         let Some(path) = &self.s3_wal_path else {
             return Ok(());
         };
-        let data = serde_json::to_vec(&self.s3_wal_entries)?;
-        let payload = PutPayload::from_bytes(data.into());
+        let mut lines = String::new();
+        for entry in &self.s3_wal_entries {
+            lines.push_str(&serde_json::to_string(entry)?);
+            lines.push('\n');
+        }
+        let payload = PutPayload::from_bytes(lines.into_bytes().into());
         self.store.put(path, payload).await?;
         Ok(())
     }
@@ -2037,11 +2070,46 @@ impl PotatoDB {
         let dialect = PostgreSqlDialect {};
         let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
             if upper.starts_with("VACUUM ") || upper == "VACUUM" {
-                let table_name = trimmed
-                    .split_whitespace()
-                    .nth(1)
-                    .ok_or("VACUUM requires a table name")?;
-                let result = self.handle_vacuum(table_name).await;
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                let (table_name, do_analyze) = if parts.len() >= 3
+                    && parts.get(1).map(|s| s.to_uppercase()) == Some("ANALYZE".into())
+                {
+                    (
+                        parts.get(2).map(|s| s.trim_matches('"')).unwrap_or(""),
+                        true,
+                    )
+                } else if parts.len() >= 2 {
+                    (parts.get(1).map(|s| s.trim_matches('"')).unwrap_or(""), false)
+                } else {
+                    return self.finalize_query(
+                        sql,
+                        started_at,
+                        Err("VACUUM requires a table name".into()),
+                    );
+                };
+                if table_name.is_empty() {
+                    return self.finalize_query(
+                        sql,
+                        started_at,
+                        Err("VACUUM requires a table name".into()),
+                    );
+                }
+                let vac_result = self.handle_vacuum(table_name).await;
+                let result = if do_analyze {
+                    match vac_result {
+                        Ok(QueryResult::Message(vac_msg)) => {
+                            match self.handle_analyze(table_name).await {
+                                Ok(QueryResult::Message(analyze_msg)) => {
+                                    Ok(QueryResult::Message(format!("{vac_msg} {analyze_msg}")))
+                                }
+                                other => other,
+                            }
+                        }
+                        other => other,
+                    }
+                } else {
+                    vac_result
+                };
                 self.catalog.flush_if_dirty().await?;
                 return self.finalize_query(sql, started_at, result);
             }
@@ -2340,7 +2408,9 @@ impl PotatoDB {
     #[allow(clippy::unused_async)]
     pub async fn backup(&self, archive_path: &str) -> Result<(), BoxError> {
         if self.is_s3 {
-            return Err("Backup is only supported for local data directories".into());
+            return Err(
+                "Backup is only supported for local data directories. For S3 databases, recovery is supported via WAL replay on startup.".into(),
+            );
         }
         let status = Command::new("tar")
             .arg("-czf")
@@ -2362,7 +2432,9 @@ impl PotatoDB {
     /// Returns an error if restore is attempted on S3 or the tar command fails.
     pub async fn restore(&mut self, archive_path: &str) -> Result<(), BoxError> {
         if self.is_s3 {
-            return Err("Restore is only supported for local data directories".into());
+            return Err(
+                "Restore is only supported for local data directories. For S3 databases, recovery is supported via WAL replay on startup.".into(),
+            );
         }
 
         let current_table_names: Vec<String> = self.catalog.tables.keys().cloned().collect();
@@ -2429,9 +2501,23 @@ impl PotatoDB {
 
     async fn collect_with_plan_cache(&mut self, sql: &str) -> Result<Vec<RecordBatch>, BoxError> {
         if is_read_only_sql(sql) {
+            // Partition awareness: log when query touches partitioned tables
+            for table_name in extract_table_names_from_readonly_sql(sql) {
+                if let Some(meta) = self.catalog.tables.get(&table_name) {
+                    if !meta.partition_columns.is_empty() {
+                        eprintln!(
+                            "potatodb: query touches partitioned table '{}' (partition cols: {:?}). \
+                             Partition pruning not yet implemented.",
+                            table_name,
+                            meta.partition_columns
+                        );
+                    }
+                }
+            }
             if let Some(plan) = self.plan_cache.get(sql).cloned() {
                 if let Ok(df) = self.ctx.execute_logical_plan(plan).await {
                     if let Ok(batches) = df.collect().await {
+                        self.plan_cache_hits = self.plan_cache_hits.saturating_add(1);
                         return Ok(batches);
                     }
                 }
@@ -2822,8 +2908,69 @@ impl PotatoDB {
     > {
         Box::pin(async move {
             let body = extract_dollar_quoted_body(sql).ok_or("DO requires $$...$$ body")?;
-            for stmt in split_sql_statements(&body) {
-                let _ = self.execute(&stmt).await?;
+            let mut vars: HashMap<String, String> = HashMap::new();
+
+            // Parse DECLARE/BEGIN/END structure
+            let (declare_section, exec_section) = if let Some(begin_idx) = find_ci(&body, "BEGIN") {
+                let declare = body[..begin_idx].trim();
+                let mut exec = body[begin_idx + 5..].trim();
+                // Strip trailing END if present (END; or END $$)
+                if let Some(end_idx) = exec.to_uppercase().rfind("END") {
+                    exec = exec[..end_idx].trim();
+                }
+                (declare, exec)
+            } else {
+                ("", body.as_str())
+            };
+
+            // Parse DECLARE section: var_name TYPE := value; or var_name TYPE;
+            if !declare_section.is_empty() {
+                let declare_body = if declare_section.to_uppercase().starts_with("DECLARE") {
+                    declare_section["DECLARE".len()..].trim()
+                } else {
+                    declare_section
+                };
+                for line in declare_body.split(';') {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let parts: Vec<&str> = line.splitn(2, ":=").collect();
+                    let name = parts[0]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let val = if parts.len() > 1 {
+                        parts[1].trim().to_string()
+                    } else {
+                        "NULL".into()
+                    };
+                    if !name.is_empty() {
+                        vars.insert(name, val);
+                    }
+                }
+            }
+
+            // Execute statements with variable substitution.
+            // Process vars by descending name length so "myvar" is replaced before "var".
+            let mut var_order: Vec<_> = vars.keys().collect();
+            var_order.sort_by(|a, b| b.len().cmp(&a.len()));
+
+            for stmt in split_sql_statements(exec_section) {
+                let mut resolved = stmt.clone();
+                for k in &var_order {
+                    let v = &vars[*k];
+                    resolved = resolved.replace(&format!("${k}"), v);
+                    // Replace whole-word variable references (standalone identifier)
+                    resolved = substitute_plpgsql_var(&resolved, k, v);
+                }
+                let upper = resolved.trim().to_uppercase();
+                if upper.starts_with("RAISE ") {
+                    // RAISE NOTICE 'msg' - treat as no-op (or could collect for messages)
+                    continue;
+                }
+                let _ = self.execute(&resolved).await?;
             }
             Ok(QueryResult::Message("DO block completed.".into()))
         })
@@ -3085,6 +3232,7 @@ impl PotatoDB {
             retention_seconds: None,
             constraints,
             file_stats: Vec::new(),
+            deletion_vectors: Vec::new(),
         };
         self.catalog.add_table(meta).await?;
         self.refresh_table_file_stats(&table_name).await?;
@@ -3156,6 +3304,7 @@ impl PotatoDB {
             retention_seconds: None,
             constraints: Vec::new(),
             file_stats: Vec::new(),
+            deletion_vectors: Vec::new(),
         };
         self.catalog.add_table(meta).await?;
         self.refresh_table_file_stats(table_name).await?;
@@ -3700,6 +3849,9 @@ impl PotatoDB {
         let deleted = old_count as usize - new_count;
 
         self.rewrite_table(&table_name, schema, surviving).await?;
+        if let Some(meta) = self.catalog.tables.get_mut(&table_name) {
+            meta.deletion_vectors.clear();
+        }
         self.record_cdc_event(&table_name, "DELETE", deleted);
 
         let after_triggers: Vec<String> = self
@@ -3807,6 +3959,9 @@ impl PotatoDB {
         let modified = df.collect().await?;
 
         self.rewrite_table(&table_name, schema, modified).await?;
+        if let Some(meta) = self.catalog.tables.get_mut(&table_name) {
+            meta.deletion_vectors.clear();
+        }
         self.validate_table_constraints(&table_name).await?;
         self.validate_check_constraints(&table_name).await?;
         self.record_cdc_event(&table_name, "UPDATE", updated as usize);
@@ -4791,6 +4946,10 @@ impl PotatoDB {
             Ok(df) => Some(df.logical_plan().clone()),
             Err(_) => None,
         };
+        if let (true, Some(ref plan)) = (is_read_only_sql(sql_template), &logical_plan) {
+            self.plan_cache
+                .insert(sql_template.to_string(), plan.clone());
+        }
         self.prepared_statements.insert(
             name.to_string(),
             PreparedStatement {
@@ -5654,6 +5813,87 @@ fn is_read_only_sql(sql: &str) -> bool {
     )
 }
 
+/// Extracts base table names from a read-only SQL string (SELECT, WITH, etc.).
+/// Returns empty if parsing fails or the statement has no table references.
+fn extract_table_names_from_readonly_sql(sql: &str) -> Vec<String> {
+    let dialect = PostgreSqlDialect {};
+    let Ok(stmts) = Parser::parse_sql(&dialect, sql) else {
+        return Vec::new();
+    };
+    let Some(stmt) = stmts.first() else {
+        return Vec::new();
+    };
+    let query = match stmt {
+        Statement::Query(q) => q.as_ref(),
+        Statement::Explain { statement, .. } => {
+            if let Statement::Query(q) = statement.as_ref() {
+                q.as_ref()
+            } else {
+                return Vec::new();
+            }
+        }
+        _ => return Vec::new(),
+    };
+    let mut tables = Vec::new();
+    extract_tables_from_set_expr(&query.body, &mut tables);
+    tables
+}
+
+fn extract_tables_from_set_expr(expr: &SetExpr, out: &mut Vec<String>) {
+    match expr {
+        SetExpr::Select(sel) => {
+            for twj in &sel.from {
+                extract_tables_from_table_with_joins(twj, out);
+            }
+        }
+        SetExpr::Query(q) => extract_tables_from_set_expr(&q.body, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            extract_tables_from_set_expr(left, out);
+            extract_tables_from_set_expr(right, out);
+        }
+        SetExpr::Values(_)
+        | SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => {}
+    }
+}
+
+fn extract_tables_from_table_with_joins(twj: &TableWithJoins, out: &mut Vec<String>) {
+    extract_tables_from_table_factor(&twj.relation, out);
+    for join in &twj.joins {
+        extract_tables_from_table_factor(&join.relation, out);
+    }
+}
+
+fn extract_tables_from_table_factor(factor: &TableFactor, out: &mut Vec<String>) {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            out.push(name.to_string().trim_matches('"').to_string());
+        }
+        TableFactor::Derived { subquery, .. } => {
+            extract_tables_from_set_expr(&subquery.body, out);
+        }
+        TableFactor::NestedJoin { table_with_joins, .. } => {
+            extract_tables_from_table_with_joins(table_with_joins, out);
+        }
+        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
+            extract_tables_from_table_factor(table, out);
+        }
+        TableFactor::MatchRecognize { table, .. } => {
+            extract_tables_from_table_factor(table, out);
+        }
+        TableFactor::TableFunction { .. }
+        | TableFactor::Function { .. }
+        | TableFactor::UNNEST { .. }
+        | TableFactor::JsonTable { .. }
+        | TableFactor::OpenJsonTable { .. }
+        | TableFactor::SemanticView { .. }
+        | TableFactor::XmlTable { .. } => {}
+    }
+}
+
 /// Returns the raw clause after `RETURNING`, if present.
 fn extract_returning_clause(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
@@ -5940,6 +6180,38 @@ fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
 
 fn find_ci(haystack: &str, needle_upper: &str) -> Option<usize> {
     haystack.to_uppercase().find(&needle_upper.to_uppercase())
+}
+
+/// Replaces whole-word variable references in SQL for PL/pgSQL variable substitution.
+/// Matches var_name only when it appears as a standalone identifier (not part of another).
+fn substitute_plpgsql_var(sql: &str, var_name: &str, value: &str) -> String {
+    if var_name.is_empty() {
+        return sql.to_string();
+    }
+    let mut result = String::with_capacity(sql.len() + value.len());
+    let mut i = 0;
+    let sql_lower = sql.to_lowercase();
+    let var_lower = var_name.to_lowercase();
+    let len = var_lower.len();
+    while i < sql.len() {
+        if i + len <= sql.len() && sql_lower[i..i + len] == var_lower {
+            let prev_ok = i == 0 || !is_plpgsql_identifier_char(sql.as_bytes()[i - 1]);
+            let next_ok = i + len >= sql.len()
+                || !is_plpgsql_identifier_char(sql.as_bytes()[i + len]);
+            if prev_ok && next_ok {
+                result.push_str(value);
+                i += len;
+                continue;
+            }
+        }
+        result.push(sql.as_bytes()[i] as char);
+        i += 1;
+    }
+    result
+}
+
+fn is_plpgsql_identifier_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn extract_dollar_quoted_body(sql: &str) -> Option<String> {

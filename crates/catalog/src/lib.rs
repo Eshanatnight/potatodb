@@ -81,6 +81,15 @@ pub enum TableConstraint {
     },
 }
 
+/// A single deletion-vector entry tracking deleted row indices in a file.
+/// Used for future incremental DML optimizations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletionEntry {
+    pub file_path: String,
+    pub deleted_row_indices: Vec<u64>,
+    pub timestamp_ms: i64,
+}
+
 /// Metadata for a single table, persisted in the catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMeta {
@@ -105,6 +114,9 @@ pub struct TableMeta {
     /// Optional per-file stats for predicate-aware pruning and diagnostics.
     #[serde(default)]
     pub file_stats: Vec<FileStats>,
+    /// Deletion vectors for incremental UPDATE/DELETE (foundational metadata).
+    #[serde(default)]
+    pub deletion_vectors: Vec<DeletionEntry>,
 }
 
 /// A single column reference within an index, with its sort direction.
@@ -682,6 +694,7 @@ mod tests {
             retention_seconds: None,
             constraints: vec![],
             file_stats: vec![],
+            deletion_vectors: vec![],
         }
     }
 
