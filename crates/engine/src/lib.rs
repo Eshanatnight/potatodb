@@ -83,8 +83,8 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use potatodb_catalog::{
     Catalog, CatalogSnapshot, ColumnDef, ColumnStatistics, FileStats, IndexColumn, IndexDef,
-    SequenceDef, TableConstraint as CatalogTableConstraint, TableMeta, TableStatistics,
-    TriggerDef, UdfDef, ViewDef,
+    MigrationRecord, SequenceDef, TableConstraint as CatalogTableConstraint, TableMeta,
+    TableStatistics, TriggerDef, UdfDef, ViewDef,
 };
 use potatodb_wal::{ArrowWal, EntryStatus, Wal, WalEntry};
 
@@ -152,6 +152,51 @@ struct CdcEvent {
 struct FulltextIndexDef {
     table_name: String,
     columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InvertedIndex {
+    postings: HashMap<String, Vec<(String, usize)>>,
+}
+
+impl InvertedIndex {
+    fn add_document(&mut self, doc_id: &str, row_idx: usize, text: &str) {
+        for token in tokenize(text) {
+            self.postings
+                .entry(token)
+                .or_default()
+                .push((doc_id.to_string(), row_idx));
+        }
+    }
+
+    #[allow(dead_code)]
+    fn search(&self, query: &str) -> Vec<(String, usize)> {
+        let tokens = tokenize(query);
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let mut result: Option<HashSet<(String, usize)>> = None;
+        for token in &tokens {
+            let matches: HashSet<(String, usize)> = self
+                .postings
+                .get(token)
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+            result = Some(match result {
+                Some(prev) => prev.intersection(&matches).cloned().collect(),
+                None => matches,
+            });
+        }
+        result.unwrap_or_default().into_iter().collect()
+    }
+}
+
+fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty() && s.len() > 1)
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +346,8 @@ pub struct PotatoDB {
     plan_cache_hits: u64,
     procedures: HashMap<String, String>,
     fulltext_indexes: HashMap<String, FulltextIndexDef>,
+    /// In-memory inverted index for full-text search, keyed by FTS index name.
+    fts_inverted_index: HashMap<String, InvertedIndex>,
     notification_queues: HashMap<String, VecDeque<String>>,
     cdc_log: VecDeque<CdcEvent>,
     cdc_capacity: usize,
@@ -321,6 +368,8 @@ pub struct PotatoDB {
     auto_compact_file_threshold: usize,
     /// I/O metrics from the last executed query.
     last_query_metrics: QueryMetrics,
+    /// Replica URLs for WAL-based read replication (metadata only).
+    replicas: Vec<String>,
 }
 
 /// Returns the Parquet compression setting from `POTATODB_PARQUET_COMPRESSION`,
@@ -653,6 +702,7 @@ impl PotatoDB {
             plan_cache_hits: 0,
             procedures: HashMap::new(),
             fulltext_indexes: HashMap::new(),
+            fts_inverted_index: HashMap::new(),
             notification_queues: HashMap::new(),
             cdc_log: VecDeque::new(),
             cdc_capacity,
@@ -665,6 +715,7 @@ impl PotatoDB {
             s3_wal_entries,
             auto_compact_file_threshold: 20,
             last_query_metrics: QueryMetrics::default(),
+            replicas: Vec::new(),
         };
         db.reload_tables().await?;
         if let Some(path) = &db.cdc_log_path {
@@ -964,6 +1015,7 @@ impl PotatoDB {
                 status: EntryStatus::Pending,
                 sql: sql.to_string(),
             });
+            // Replication: would forward WAL entry to self.replicas here
             return Ok(());
         }
         if let Some(wal) = self.wal.as_mut() {
@@ -972,6 +1024,7 @@ impl PotatoDB {
                 status: EntryStatus::Pending,
                 sql: sql.to_string(),
             })?;
+            // Replication: would forward WAL entry to self.replicas here
         }
         Ok(())
     }
@@ -980,6 +1033,7 @@ impl PotatoDB {
         if self.replaying_wal || self.in_transaction() {
             return Ok(());
         }
+        // Replication: would forward committed WAL to self.replicas here
         if self.is_s3 {
             self.s3_wal_entries.push(WalEntry {
                 txn_id: 0,
@@ -1331,6 +1385,42 @@ impl PotatoDB {
                 .await;
         }
 
+        self.rebuild_fts_indexes().await?;
+
+        Ok(())
+    }
+
+    /// Rebuilds all inverted indexes from fulltext_indexes metadata and table data.
+    async fn rebuild_fts_indexes(&mut self) -> Result<(), BoxError> {
+        for (idx_name, def) in self.fulltext_indexes.clone().iter() {
+            let table_name = &def.table_name;
+            let columns = &def.columns;
+            let cols_sql = columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let select_sql = format!("SELECT {cols_sql} FROM \"{table_name}\"");
+            let batches = self.collect_with_plan_cache(&select_sql).await?;
+            let mut idx = InvertedIndex::default();
+            let mut row_offset = 0;
+            for batch in &batches {
+                let num_rows = batch.num_rows();
+                for row in 0..num_rows {
+                    let mut text_parts = Vec::new();
+                    for col_name in columns {
+                        if let Some(col) = batch.column_by_name(col_name) {
+                            let s = array_value_to_string(col.as_ref(), row);
+                            text_parts.push(s);
+                        }
+                    }
+                    let text = text_parts.join(" ");
+                    idx.add_document(table_name, row_offset + row, &text);
+                }
+                row_offset += num_rows;
+            }
+            self.fts_inverted_index.insert(idx_name.clone(), idx);
+        }
         Ok(())
     }
 
@@ -1931,6 +2021,16 @@ impl PotatoDB {
             return self.finalize_query(sql, started_at, result);
         }
 
+        if upper.contains("PG_CATALOG.")
+            || upper.contains("PG_TYPE")
+            || upper.contains("PG_CLASS")
+            || upper.contains("PG_NAMESPACE")
+            || upper.contains("PG_ATTRIBUTE")
+        {
+            let result = self.handle_pg_catalog_query(trimmed);
+            return self.finalize_query(sql, started_at, result);
+        }
+
         if upper.starts_with("CREATE FUNCTION ") {
             let result = self.handle_create_function(trimmed).await;
             if result.is_ok() {
@@ -1989,7 +2089,7 @@ impl PotatoDB {
             return self.finalize_query(sql, started_at, result);
         }
         if upper.starts_with("CREATE FULLTEXT INDEX ") {
-            let result = self.handle_create_fulltext_index(trimmed);
+            let result = self.handle_create_fulltext_index(trimmed).await;
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
@@ -2025,6 +2125,30 @@ impl PotatoDB {
                 trimmed["RELEASE ".len()..].trim().trim_matches('"')
             };
             let result = self.handle_release_savepoint(name).await;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("CREATE MIGRATION ") {
+            let result = self.handle_create_migration(trimmed).await;
+            if result.is_ok() {
+                self.wal_finish_autocommit(true)?;
+            }
+            self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper == "MIGRATE" || upper.starts_with("MIGRATE ") {
+            let result = self.handle_migrate(trimmed).await;
+            if result.is_ok() {
+                self.wal_finish_autocommit(true)?;
+            }
+            self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("ADD REPLICA ") {
+            let result = self.handle_add_replica(trimmed);
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("REMOVE REPLICA ") {
+            let result = self.handle_remove_replica(trimmed);
             return self.finalize_query(sql, started_at, result);
         }
 
@@ -2748,6 +2872,88 @@ impl PotatoDB {
         Ok(QueryResult::Records(vec![batch]))
     }
 
+    fn handle_pg_catalog_query(&self, sql: &str) -> Result<QueryResult, BoxError> {
+        let upper = sql.to_uppercase();
+        if upper.contains("PG_TYPE") {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("oid", DataType::Int32, false),
+                Field::new("typname", DataType::Utf8, false),
+                Field::new("typlen", DataType::Int16, false),
+            ]));
+            let oid_arr = Int32Array::from(vec![23, 1043, 16, 701, 25, 1114, 1082]);
+            let name_arr = StringArray::from(vec![
+                "int4", "varchar", "bool", "float8", "text", "timestamp", "date",
+            ]);
+            let len_arr = Int16Array::from(vec![4, -1, 1, 8, -1, 8, 4]);
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(oid_arr),
+                    Arc::new(name_arr),
+                    Arc::new(len_arr),
+                ],
+            )?;
+            return Ok(QueryResult::Records(vec![batch]));
+        }
+        if upper.contains("PG_CLASS") {
+            let table_names: Vec<String> = self.catalog.tables.keys().cloned().collect();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("oid", DataType::Int32, false),
+                Field::new("relname", DataType::Utf8, false),
+            ]));
+            let oids: Vec<i32> = (1..=table_names.len() as i32).collect();
+            let oid_arr = Int32Array::from(oids);
+            let name_arr = StringArray::from(table_names);
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(oid_arr), Arc::new(name_arr)])?;
+            return Ok(QueryResult::Records(vec![batch]));
+        }
+        if upper.contains("PG_NAMESPACE") {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("oid", DataType::Int32, false),
+                Field::new("nspname", DataType::Utf8, false),
+            ]));
+            let oid_arr = Int32Array::from(vec![2200]);
+            let name_arr = StringArray::from(vec!["public"]);
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(oid_arr), Arc::new(name_arr)])?;
+            return Ok(QueryResult::Records(vec![batch]));
+        }
+        if upper.contains("PG_ATTRIBUTE") {
+            let mut attrelids = Vec::new();
+            let mut attnames = Vec::new();
+            let mut attnums = Vec::new();
+            let mut atttypids = Vec::new();
+            let mut rel_oid: i32 = 1;
+            for (_table_name, meta) in &self.catalog.tables {
+                for (idx, col) in meta.columns.iter().enumerate() {
+                    attrelids.push(rel_oid);
+                    attnames.push(col.name.clone());
+                    attnums.push((idx + 1) as i32);
+                    atttypids.push(sql_type_to_pg_oid(&col.data_type));
+                }
+                rel_oid += 1;
+            }
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("attrelid", DataType::Int32, false),
+                Field::new("attname", DataType::Utf8, false),
+                Field::new("attnum", DataType::Int32, false),
+                Field::new("atttypid", DataType::Int32, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(attrelids)),
+                    Arc::new(StringArray::from(attnames)),
+                    Arc::new(Int32Array::from(attnums)),
+                    Arc::new(Int32Array::from(atttypids)),
+                ],
+            )?;
+            return Ok(QueryResult::Records(vec![batch]));
+        }
+        Ok(QueryResult::Records(vec![]))
+    }
+
     fn handle_listen(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let channel = sql
             .split_whitespace()
@@ -2976,7 +3182,7 @@ impl PotatoDB {
         })
     }
 
-    fn handle_create_fulltext_index(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+    async fn handle_create_fulltext_index(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_uppercase();
         if !upper.starts_with("CREATE FULLTEXT INDEX ") {
@@ -3001,13 +3207,42 @@ impl PotatoDB {
         if columns.is_empty() {
             return Err("FULLTEXT INDEX requires at least one column".into());
         }
+        self.wal_append_pending(sql)?;
         self.fulltext_indexes.insert(
             idx_name.clone(),
             FulltextIndexDef {
                 table_name: table_name.clone(),
-                columns,
+                columns: columns.clone(),
             },
         );
+
+        // Build inverted index from table data
+        let cols_sql = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_sql = format!("SELECT {cols_sql} FROM \"{table_name}\"");
+        let batches = self.collect_with_plan_cache(&select_sql).await?;
+        let mut idx = InvertedIndex::default();
+        let mut row_offset = 0;
+        for batch in &batches {
+            let num_rows = batch.num_rows();
+            for row in 0..num_rows {
+                let mut text_parts = Vec::new();
+                for col_name in &columns {
+                    if let Some(col) = batch.column_by_name(col_name) {
+                        let s = array_value_to_string(col.as_ref(), row);
+                        text_parts.push(s);
+                    }
+                }
+                let text = text_parts.join(" ");
+                idx.add_document(&table_name, row_offset + row, &text);
+            }
+            row_offset += num_rows;
+        }
+        self.fts_inverted_index.insert(idx_name.clone(), idx);
+
         Ok(QueryResult::Message(format!(
             "Fulltext index '{idx_name}' created on '{table_name}'."
         )))
@@ -3043,6 +3278,128 @@ impl PotatoDB {
         self.catalog.user_roles.entry(name.clone()).or_default();
         self.catalog.save().await?;
         Ok(QueryResult::Message(format!("User '{name}' created.")))
+    }
+
+    fn handle_add_replica(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        // ADD REPLICA 'url' or ADD REPLICA "url"
+        let rest = sql["ADD REPLICA ".len()..].trim().trim_end_matches(';');
+        let url = rest
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if url.is_empty() {
+            return Err("ADD REPLICA requires a URL".into());
+        }
+        if !self.replicas.contains(&url) {
+            self.replicas.push(url.clone());
+        }
+        Ok(QueryResult::Message(format!("Replica '{url}' added.")))
+    }
+
+    fn handle_remove_replica(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        let rest = sql["REMOVE REPLICA ".len()..].trim().trim_end_matches(';');
+        let url = rest
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
+        if url.is_empty() {
+            return Err("REMOVE REPLICA requires a URL".into());
+        }
+        if self.replicas.iter().any(|r| r == &url) {
+            self.replicas.retain(|r| r != &url);
+        }
+        Ok(QueryResult::Message(format!("Replica '{url}' removed.")))
+    }
+
+    async fn handle_create_migration(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        // CREATE MIGRATION <version> <description> AS $$ sql $$
+        let rest = sql["CREATE MIGRATION ".len()..].trim().trim_end_matches(';');
+        let mut tokens = rest.splitn(2, |c: char| c.is_ascii_whitespace());
+        let version_str = tokens.next().ok_or("CREATE MIGRATION requires a version number")?;
+        let version: u64 = version_str
+            .parse()
+            .map_err(|_| "CREATE MIGRATION version must be a non-negative integer")?;
+        let after_version = tokens.next().ok_or("CREATE MIGRATION requires description and AS $$ sql $$")?;
+        let as_delim = "AS $$";
+        let upper_rest = after_version.to_uppercase();
+        let as_idx = upper_rest
+            .find(as_delim)
+            .ok_or("CREATE MIGRATION requires AS $$ ... $$")?;
+        let description = after_version[..as_idx].trim().to_string();
+        let sql_body = after_version[as_idx + as_delim.len()..]
+            .trim_end()
+            .strip_suffix("$$")
+            .ok_or("CREATE MIGRATION requires closing $$")?
+            .trim()
+            .to_string();
+        if self.catalog.migrations.iter().any(|m| m.version == version) {
+            return Err(format!("Migration version {version} already exists").into());
+        }
+        let record = MigrationRecord {
+            version,
+            description: description.clone(),
+            sql: sql_body.clone(),
+            applied_at_ms: 0, // Not applied yet
+        };
+        self.catalog.migrations.push(record);
+        self.catalog.migrations.sort_by_key(|m| m.version);
+        self.catalog.save().await?;
+        Ok(QueryResult::Message(format!(
+            "Migration {version} '{description}' registered."
+        )))
+    }
+
+    async fn handle_migrate(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        // MIGRATE or MIGRATE TO <version>
+        let rest = sql["MIGRATE".len()..].trim().trim_end_matches(';');
+        let target_version = if rest.to_uppercase().starts_with("TO ") {
+            let v_str = rest["TO ".len()..].trim();
+            Some(
+                v_str
+                    .parse::<u64>()
+                    .map_err(|_| "MIGRATE TO requires a valid version number")?,
+            )
+        } else if rest.is_empty() {
+            None
+        } else {
+            return Err("MIGRATE expects optional TO <version>".into());
+        };
+        let current = self.catalog.schema_version;
+        let pending: Vec<_> = self
+            .catalog
+            .migrations
+            .iter()
+            .filter(|m| m.version > current)
+            .cloned()
+            .collect();
+        let to_run: Vec<_> = if let Some(target) = target_version {
+            pending
+                .into_iter()
+                .filter(|m| m.version <= target)
+                .collect()
+        } else {
+            pending
+        };
+        let mut applied = 0;
+        for m in to_run {
+            self.execute(&m.sql).await?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            if let Some(rec) = self.catalog.migrations.iter_mut().find(|r| r.version == m.version) {
+                rec.applied_at_ms = now_ms;
+            }
+            self.catalog.schema_version = m.version;
+            applied += 1;
+        }
+        self.catalog.save().await?;
+        Ok(QueryResult::Message(format!(
+            "Applied {applied} migration(s). Schema version: {}.",
+            self.catalog.schema_version
+        )))
     }
 
     async fn handle_create_role(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
@@ -4462,6 +4819,49 @@ impl PotatoDB {
                 );
                 self.ctx.sql(&insert_sql).await?.collect().await?;
                 let _ = self.ctx.deregister_table(&tmp_name);
+
+                // Update FTS inverted indexes for the new rows
+                let row_offset: usize = match self
+                    .collect_with_plan_cache(&format!("SELECT COUNT(*) FROM \"{table_name}\""))
+                    .await
+                {
+                    Ok(count_batches) => count_batches
+                        .first()
+                        .and_then(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .map(|a| a.value(0) as usize)
+                        })
+                        .map(|total| total.saturating_sub(inserted_rows))
+                        .unwrap_or(0),
+                    Err(_) => 0,
+                };
+                for (idx_name, def) in &self.fulltext_indexes.clone() {
+                    if def.table_name != table_name {
+                        continue;
+                    }
+                    if let Some(idx) = self.fts_inverted_index.get_mut(idx_name) {
+                        let mut row_idx = row_offset;
+                        for batch in &batches {
+                            for row in 0..batch.num_rows() {
+                                let mut text_parts = Vec::new();
+                                for col_name in &def.columns {
+                                    let s = target_columns
+                                        .iter()
+                                        .position(|c| c == col_name)
+                                        .map(|i| array_value_to_string(batch.column(i).as_ref(), row))
+                                        .unwrap_or_default();
+                                    text_parts.push(s);
+                                }
+                                let text = text_parts.join(" ");
+                                idx.add_document(&table_name, row_idx, &text);
+                                row_idx += 1;
+                            }
+                        }
+                    }
+                }
             }
 
             self.validate_constraints_batch(&table_name, &target_columns, &batches)
@@ -6557,6 +6957,47 @@ fn recover_wal_entries(entries: &[WalEntry]) -> Vec<WalEntry> {
         .collect()
 }
 
+/// Extracts a string representation from an array cell for FTS tokenization.
+fn array_value_to_string(array: &dyn Array, row: usize) -> String {
+    if array.is_null(row) {
+        return String::new();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int8Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int16Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+        return a.value(row).to_string();
+    }
+    String::new()
+}
+
 fn array_value_to_sql_literal(array: &dyn Array, row: usize) -> String {
     if array.is_null(row) {
         return "NULL".to_string();
@@ -6805,6 +7246,38 @@ fn sqlparser_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, BoxError>
         }
         SqlDataType::Bytea | SqlDataType::Blob(_) => Ok(DataType::Binary),
         other => Err(format!("Unsupported SQL type: {other}").into()),
+    }
+}
+
+/// Maps a SQL type string to a PostgreSQL pg_type OID for pg_catalog compatibility.
+fn sql_type_to_pg_oid(sql_type: &str) -> i32 {
+    let upper = sql_type.to_uppercase();
+    if upper.contains("BIGINT") {
+        20 // int8
+    } else if upper.contains("SMALLINT") {
+        21 // int2
+    } else if upper.contains("INT") {
+        23 // int4
+    } else if upper.contains("VARCHAR") || upper.contains("CHAR") {
+        1043 // varchar
+    } else if upper.contains("BOOL") {
+        16 // bool
+    } else if upper.contains("FLOAT") || upper.contains("DOUBLE") {
+        701 // float8
+    } else if upper.contains("REAL") {
+        700 // float4
+    } else if upper == "TEXT" || upper.contains("TEXT") {
+        25 // text
+    } else if upper.contains("TIMESTAMP") {
+        1114 // timestamp
+    } else if upper.contains("DATE") {
+        1082 // date
+    } else if upper.contains("UUID") {
+        2950 // uuid
+    } else if upper.contains("DECIMAL") || upper.contains("NUMERIC") {
+        1700 // numeric
+    } else {
+        25 // default to text
     }
 }
 

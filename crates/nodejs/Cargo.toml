@@ -1,0 +1,7 @@
+[package]
+name = "potatodb-nodejs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+potatodb-engine.workspace = true

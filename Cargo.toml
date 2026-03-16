@@ -4,6 +4,7 @@ members = [
     "crates/display",
     "crates/engine",
     "crates/ffi",
+    "crates/nodejs",
     "crates/repl",
     "crates/tui",
     "crates/wal",
@@ -24,7 +25,7 @@ arrow = { version = "57", features = ["prettyprint"] }
 arrow-cast = { version = "57", features = ["prettyprint"] }
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 datafusion = "52"
 futures = "0.3"
 object_store = { version = "0.12", features = ["aws"] }
@@ -35,6 +36,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = "0.59"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-tungstenite = "0.26"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"

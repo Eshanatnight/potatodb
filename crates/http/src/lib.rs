@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -60,6 +61,7 @@ fn build_router(db: Arc<RwLock<PotatoDB>>) -> Router {
         .route("/tables", get(list_tables))
         .route("/tables/{name}/stats", get(table_stats))
         .route("/query", post(run_query))
+        .route("/ws", get(ws_handler))
         .with_state(state)
 }
 
@@ -125,6 +127,50 @@ async fn table_stats(Path(name): Path<String>, State(state): State<AppState>) ->
         total_bytes,
         oldest_file_age_secs,
     })
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+async fn handle_ws(mut socket: WebSocket, state: AppState) {
+    // Send a welcome message
+    let _ = socket
+        .send(Message::Text(
+            r#"{"type":"connected","message":"PotatoDB WebSocket"}"#.into(),
+        ))
+        .await;
+
+    // Poll for CDC events every second
+    let mut _last_seen = 0i64;
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Handle subscribe commands like {"subscribe": "cdc", "table": "users"}
+                        let _ = socket
+                            .send(Message::Text(
+                                format!(r#"{{"type":"ack","message":"received: {text}"}}"#).into(),
+                            ))
+                            .await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                // Poll CDC events
+                let db = state.db.read().await;
+                let _sql = "SELECT * FROM potatodb_cdc";
+                drop(db);
+                // For now just send a heartbeat
+                let _ = socket
+                    .send(Message::Text(r#"{"type":"heartbeat"}"#.into()))
+                    .await;
+            }
+        }
+    }
 }
 
 async fn run_query(

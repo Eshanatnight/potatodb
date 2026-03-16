@@ -219,6 +219,15 @@ pub struct TriggerDef {
     pub body: String,
 }
 
+/// A single migration record for schema versioning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationRecord {
+    pub version: u64,
+    pub description: String,
+    pub sql: String,
+    pub applied_at_ms: i64,
+}
+
 /// On-disk representation of the catalog JSON.
 #[derive(Serialize, Deserialize)]
 struct CatalogData {
@@ -241,6 +250,8 @@ struct CatalogData {
     triggers: HashMap<String, TriggerDef>,
     #[serde(default)]
     schema_version: u64,
+    #[serde(default)]
+    migrations: Vec<MigrationRecord>,
 }
 
 /// A point-in-time snapshot of the full catalog state, captured at
@@ -256,6 +267,8 @@ pub struct CatalogSnapshot {
     pub roles: HashMap<String, RoleDef>,
     pub user_roles: HashMap<String, Vec<String>>,
     pub triggers: HashMap<String, TriggerDef>,
+    pub schema_version: u64,
+    pub migrations: Vec<MigrationRecord>,
 }
 
 /// In-memory catalog backed by an [`ObjectStore`] for persistence.
@@ -284,6 +297,8 @@ pub struct Catalog {
     pub triggers: HashMap<String, TriggerDef>,
     /// Schema version number for migrations.
     pub schema_version: u64,
+    /// Migration records (version, description, SQL, applied_at_ms).
+    pub migrations: Vec<MigrationRecord>,
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
     /// When `true`, [`save`](Self::save) is a no-op; mutations
@@ -323,6 +338,7 @@ impl Catalog {
                         user_roles: data.user_roles,
                         triggers: data.triggers,
                         schema_version: data.schema_version,
+                        migrations: data.migrations,
                         store,
                         path: catalog_path,
                         in_transaction: false,
@@ -342,6 +358,7 @@ impl Catalog {
                         user_roles: HashMap::new(),
                         triggers: HashMap::new(),
                         schema_version: 0,
+                        migrations: Vec::new(),
                         store,
                         path: catalog_path,
                         in_transaction: false,
@@ -360,6 +377,7 @@ impl Catalog {
                 user_roles: HashMap::new(),
                 triggers: HashMap::new(),
                 schema_version: 0,
+                migrations: Vec::new(),
                 store,
                 path: catalog_path,
                 in_transaction: false,
@@ -426,6 +444,7 @@ impl Catalog {
             user_roles: self.user_roles.clone(),
             triggers: self.triggers.clone(),
             schema_version: self.schema_version,
+            migrations: self.migrations.clone(),
         };
         let json = serde_json::to_string_pretty(&data)?;
         let payload = PutPayload::from_bytes(json.into_bytes().into());
@@ -446,6 +465,8 @@ impl Catalog {
             roles: self.roles.clone(),
             user_roles: self.user_roles.clone(),
             triggers: self.triggers.clone(),
+            schema_version: self.schema_version,
+            migrations: self.migrations.clone(),
         }
     }
 
@@ -460,6 +481,8 @@ impl Catalog {
         self.roles = snap.roles;
         self.user_roles = snap.user_roles;
         self.triggers = snap.triggers;
+        self.schema_version = snap.schema_version;
+        self.migrations = snap.migrations;
     }
 
     /// Enables or disables transaction mode.
