@@ -29,7 +29,7 @@ export POTATODB_BATCH_SIZE=32768
 export POTATODB_PARQUET_WRITE_BATCH_SIZE=32768
 export POTATODB_WRITE_BUFFER_MS=1000
 export POTATODB_WRITE_BUFFER_BYTES=134217728
-export POTATODB_TARGET_PARTITIONS=4 
+export POTATODB_TARGET_PARTITIONS=4
 
 if [[ ! -f "$SQL_FILE" ]]; then
     echo "Error: SQL file not found: $SQL_FILE" >&2
@@ -39,7 +39,7 @@ fi
 # Build release binary if needed
 if [[ ! -f "target/release/potatodb" ]]; then
     echo "Building potatodb (release)..."
-    cargo build --release -p potatodb
+    cargo build --profile profiling -p potatodb
 fi
 
 if [[ -z "$SAMPLE_OUTPUT" ]]; then
@@ -56,7 +56,7 @@ echo ""
 # Start potatodb in background
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
-"$REPO_ROOT/target/release/potatodb" --data-dir "$DATA_DIR" -f "$SQL_FILE" &
+"$REPO_ROOT/target/profiling/potatodb" --data-dir "$DATA_DIR" -f "$SQL_FILE" &
 PID=$!
 
 # Give it a moment to start

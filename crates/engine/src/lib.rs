@@ -695,6 +695,28 @@ impl PotatoDB {
         self.catalog.udfs.keys().cloned().collect()
     }
 
+    /// Returns all sequence names.
+    #[must_use]
+    pub fn sequence_names(&self) -> Vec<String> {
+        self.catalog.sequences.keys().cloned().collect()
+    }
+
+    /// Returns `(username, roles)` for every known user.
+    #[must_use]
+    pub fn user_info(&self) -> Vec<(String, Vec<String>)> {
+        self.users
+            .keys()
+            .map(|u| {
+                let roles: Vec<String> = self
+                    .user_roles
+                    .get(u)
+                    .map(|rs| rs.iter().cloned().collect())
+                    .unwrap_or_default();
+                (u.clone(), roles)
+            })
+            .collect()
+    }
+
     /// Returns the number of parquet files currently backing a table.
     ///
     /// # Errors

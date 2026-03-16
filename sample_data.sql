@@ -38,7 +38,7 @@ SELECT
         WHEN 8 THEN 'Miami'
         ELSE 'Dallas'
     END                                                AS city
-FROM generate_series(1, 500000000) AS gs;
+FROM generate_series(1, 5000000) AS gs;
 
 -- Insert 500,000 products
 INSERT INTO products (id, name, price, category)
@@ -53,7 +53,7 @@ SELECT
         WHEN 3 THEN 'Accessories'
         ELSE 'Other'
     END                                                AS category
-FROM generate_series(1, 500000000) AS gs;
+FROM generate_series(1, 5000000) AS gs;
 
 -- Insert 500,000 orders
 INSERT INTO orders (id, customer_id, product_id, quantity, order_date)
@@ -63,7 +63,7 @@ SELECT
     CAST(random() * 500000 + 1 AS INT)                         AS product_id,
     CAST(random() * 10 + 1 AS INT)                             AS quantity,
     CURRENT_DATE - (gs.value % 365)                            AS order_date
-FROM generate_series(1, 500000000) AS gs;
+FROM generate_series(1, 5000000) AS gs;
 
 FLUSH;
 

@@ -770,12 +770,20 @@ impl App {
     }
 
     fn try_execute(&mut self) -> Action {
-        let sql = strip_sql_comments(&self.input_text());
+        let raw = self.input_text();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Action::None;
+        }
+        self.save_history_entry(&raw);
+        self.clear_input();
+        if trimmed.starts_with('\\') {
+            return Action::Execute(trimmed.to_string());
+        }
+        let sql = strip_sql_comments(&raw);
         if sql.is_empty() {
             return Action::None;
         }
-        self.save_history_entry(&self.input_text());
-        self.clear_input();
         Action::Execute(sql)
     }
 
@@ -788,8 +796,9 @@ impl App {
             (_, KeyCode::Enter) => {
                 let text = self.input_text();
                 let trimmed = text.trim();
-                // If the input ends with `;`, execute immediately
-                // instead of inserting a newline.
+                if trimmed.starts_with('\\') && !trimmed.is_empty() {
+                    return self.try_execute();
+                }
                 if trimmed.ends_with(';') && !trimmed.is_empty() {
                     return self.try_execute();
                 }
@@ -1094,7 +1103,119 @@ impl App {
 
     // ── Data loading ──────────────────────────────────────────
 
+    async fn run_meta_command(&mut self, db: &mut PotatoDB, cmd: &str) {
+        let start = Instant::now();
+        let trimmed = cmd.trim();
+
+        let sql_translation = match trimmed {
+            "\\dt" => Some(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = 'public' ORDER BY table_name"
+                    .to_string(),
+            ),
+            "\\dv" => {
+                let mut views = db.view_names();
+                views.sort();
+                self.set_meta_results(
+                    vec!["view_name".into()],
+                    views.into_iter().map(|v| vec![v]).collect(),
+                    start,
+                );
+                return;
+            }
+            "\\di" => {
+                let mut idx = db.indexes();
+                idx.sort();
+                self.set_meta_results(
+                    vec!["index_name".into(), "table_name".into()],
+                    idx.into_iter().map(|(n, t)| vec![n, t]).collect(),
+                    start,
+                );
+                return;
+            }
+            "\\ds" => {
+                let mut seqs = db.sequence_names();
+                seqs.sort();
+                self.set_meta_results(
+                    vec!["sequence_name".into()],
+                    seqs.into_iter().map(|s| vec![s]).collect(),
+                    start,
+                );
+                return;
+            }
+            "\\df" => {
+                let mut fns = db.function_names();
+                fns.sort();
+                self.set_meta_results(
+                    vec!["function_name".into()],
+                    fns.into_iter().map(|f| vec![f]).collect(),
+                    start,
+                );
+                return;
+            }
+            "\\du" => {
+                let mut users = db.user_info();
+                users.sort_by(|a, b| a.0.cmp(&b.0));
+                self.set_meta_results(
+                    vec!["user_name".into(), "roles".into()],
+                    users
+                        .into_iter()
+                        .map(|(u, r)| vec![u, r.join(", ")])
+                        .collect(),
+                    start,
+                );
+                return;
+            }
+            s if s.starts_with("\\d ") => {
+                let table = s[3..].trim().trim_matches('"');
+                Some(format!("DESCRIBE {table}"))
+            }
+            _ => {
+                self.results = QueryResults::from_error(&format!("Unknown command: {cmd}"));
+                self.status = "Error".into();
+                self.elapsed = format_elapsed(start.elapsed());
+                return;
+            }
+        };
+
+        if let Some(translated) = sql_translation {
+            self.execute_sql(db, &translated).await;
+        }
+    }
+
+    fn set_meta_results(&mut self, headers: Vec<String>, rows: Vec<Vec<String>>, start: Instant) {
+        let count = rows.len();
+        let widths: Vec<u16> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let max_data = rows.iter().map(|r| r.get(i).map_or(0, String::len)).max().unwrap_or(0);
+                h.len().max(max_data) as u16
+            })
+            .collect();
+        self.results = QueryResults {
+            headers,
+            rows,
+            column_widths: widths,
+            message: None,
+        };
+        self.status = format!("{count} row(s)");
+        self.elapsed = format_elapsed(start.elapsed());
+        self.table_state = TableState::default();
+        if count > 0 {
+            self.table_state.select(Some(0));
+        }
+    }
+
     async fn run_query(&mut self, db: &mut PotatoDB, sql: &str) {
+        if sql.trim().starts_with('\\') {
+            self.run_meta_command(db, sql).await;
+            return;
+        }
+        self.execute_sql(db, sql).await;
+    }
+
+    async fn execute_sql(&mut self, db: &mut PotatoDB, sql: &str) {
         self.spinner_state = self.spinner_state.wrapping_add(1);
         let start = Instant::now();
         match db.execute(sql).await {
