@@ -172,6 +172,41 @@ pub struct UdfDef {
     pub body: String,
 }
 
+/// A structured privilege entry (e.g. `SELECT ON orders`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Privilege {
+    /// Privilege kind: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `ALL`, or a custom string.
+    pub kind: String,
+    /// Optional table scope. `None` means the privilege applies to all tables.
+    pub table: Option<String>,
+}
+
+/// Persisted user account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDef {
+    pub name: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+/// Persisted role definition with its privileges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleDef {
+    pub name: String,
+    #[serde(default)]
+    pub privileges: Vec<Privilege>,
+}
+
+/// Persisted trigger definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table: String,
+    pub event: String,
+    pub timing: String,
+    pub body: String,
+}
+
 /// On-disk representation of the catalog JSON.
 #[derive(Serialize, Deserialize)]
 struct CatalogData {
@@ -184,17 +219,32 @@ struct CatalogData {
     sequences: HashMap<String, SequenceDef>,
     #[serde(default)]
     udfs: HashMap<String, UdfDef>,
+    #[serde(default)]
+    users: HashMap<String, UserDef>,
+    #[serde(default)]
+    roles: HashMap<String, RoleDef>,
+    #[serde(default)]
+    user_roles: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    triggers: HashMap<String, TriggerDef>,
+    #[serde(default)]
+    schema_version: u64,
 }
 
-/// A point-in-time snapshot of the catalog's tables, indexes, and views,
-/// captured at `BEGIN` and used by `ROLLBACK` to restore state.
-pub type CatalogSnapshot = (
-    HashMap<String, TableMeta>,
-    HashMap<String, IndexDef>,
-    HashMap<String, ViewDef>,
-    HashMap<String, SequenceDef>,
-    HashMap<String, UdfDef>,
-);
+/// A point-in-time snapshot of the full catalog state, captured at
+/// `BEGIN` and used by `ROLLBACK` to restore state.
+#[derive(Clone)]
+pub struct CatalogSnapshot {
+    pub tables: HashMap<String, TableMeta>,
+    pub indexes: HashMap<String, IndexDef>,
+    pub views: HashMap<String, ViewDef>,
+    pub sequences: HashMap<String, SequenceDef>,
+    pub udfs: HashMap<String, UdfDef>,
+    pub users: HashMap<String, UserDef>,
+    pub roles: HashMap<String, RoleDef>,
+    pub user_roles: HashMap<String, Vec<String>>,
+    pub triggers: HashMap<String, TriggerDef>,
+}
 
 /// In-memory catalog backed by an [`ObjectStore`] for persistence.
 ///
@@ -212,6 +262,16 @@ pub struct Catalog {
     pub sequences: HashMap<String, SequenceDef>,
     /// All registered SQL functions, keyed by function name.
     pub udfs: HashMap<String, UdfDef>,
+    /// Persisted user accounts, keyed by username.
+    pub users: HashMap<String, UserDef>,
+    /// Persisted role definitions, keyed by role name.
+    pub roles: HashMap<String, RoleDef>,
+    /// Maps username -> list of role names.
+    pub user_roles: HashMap<String, Vec<String>>,
+    /// Persisted trigger definitions, keyed by trigger name.
+    pub triggers: HashMap<String, TriggerDef>,
+    /// Schema version number for migrations.
+    pub schema_version: u64,
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
     /// When `true`, [`save`](Self::save) is a no-op; mutations
@@ -236,48 +296,65 @@ impl Catalog {
         store: Arc<dyn ObjectStore>,
         catalog_path: ObjPath,
     ) -> Result<Self, BoxError> {
-        let (tables, indexes, views, sequences, udfs) = match store.get(&catalog_path).await {
+        match store.get(&catalog_path).await {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 if let Ok(data) = serde_json::from_slice::<CatalogData>(&bytes) {
-                    (
-                        data.tables,
-                        data.indexes,
-                        data.views,
-                        data.sequences,
-                        data.udfs,
-                    )
+                    Ok(Self {
+                        tables: data.tables,
+                        indexes: data.indexes,
+                        views: data.views,
+                        sequences: data.sequences,
+                        udfs: data.udfs,
+                        users: data.users,
+                        roles: data.roles,
+                        user_roles: data.user_roles,
+                        triggers: data.triggers,
+                        schema_version: data.schema_version,
+                        store,
+                        path: catalog_path,
+                        in_transaction: false,
+                        dirty: false,
+                    })
                 } else {
-                    let tables: HashMap<String, TableMeta> = serde_json::from_slice(&bytes)?;
-                    (
+                    let tables: HashMap<String, TableMeta> =
+                        serde_json::from_slice(&bytes)?;
+                    Ok(Self {
                         tables,
-                        HashMap::new(),
-                        HashMap::new(),
-                        HashMap::new(),
-                        HashMap::new(),
-                    )
+                        indexes: HashMap::new(),
+                        views: HashMap::new(),
+                        sequences: HashMap::new(),
+                        udfs: HashMap::new(),
+                        users: HashMap::new(),
+                        roles: HashMap::new(),
+                        user_roles: HashMap::new(),
+                        triggers: HashMap::new(),
+                        schema_version: 0,
+                        store,
+                        path: catalog_path,
+                        in_transaction: false,
+                        dirty: false,
+                    })
                 }
             }
-            Err(object_store::Error::NotFound { .. }) => (
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-            ),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(Self {
-            tables,
-            indexes,
-            views,
-            sequences,
-            udfs,
-            store,
-            path: catalog_path,
-            in_transaction: false,
-            dirty: false,
-        })
+            Err(object_store::Error::NotFound { .. }) => Ok(Self {
+                tables: HashMap::new(),
+                indexes: HashMap::new(),
+                views: HashMap::new(),
+                sequences: HashMap::new(),
+                udfs: HashMap::new(),
+                users: HashMap::new(),
+                roles: HashMap::new(),
+                user_roles: HashMap::new(),
+                triggers: HashMap::new(),
+                schema_version: 0,
+                store,
+                path: catalog_path,
+                in_transaction: false,
+                dirty: false,
+            }),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Serializes the full catalog to the backing store.
@@ -332,6 +409,11 @@ impl Catalog {
             views: self.views.clone(),
             sequences: self.sequences.clone(),
             udfs: self.udfs.clone(),
+            users: self.users.clone(),
+            roles: self.roles.clone(),
+            user_roles: self.user_roles.clone(),
+            triggers: self.triggers.clone(),
+            schema_version: self.schema_version,
         };
         let json = serde_json::to_string_pretty(&data)?;
         let payload = PutPayload::from_bytes(json.into_bytes().into());
@@ -342,22 +424,30 @@ impl Catalog {
     /// Captures a point-in-time snapshot of all tables, indexes, and views.
     #[must_use]
     pub fn snapshot(&self) -> CatalogSnapshot {
-        (
-            self.tables.clone(),
-            self.indexes.clone(),
-            self.views.clone(),
-            self.sequences.clone(),
-            self.udfs.clone(),
-        )
+        CatalogSnapshot {
+            tables: self.tables.clone(),
+            indexes: self.indexes.clone(),
+            views: self.views.clone(),
+            sequences: self.sequences.clone(),
+            udfs: self.udfs.clone(),
+            users: self.users.clone(),
+            roles: self.roles.clone(),
+            user_roles: self.user_roles.clone(),
+            triggers: self.triggers.clone(),
+        }
     }
 
-    /// Restores tables, indexes, and views from a previously captured snapshot.
+    /// Restores all catalog state from a previously captured snapshot.
     pub fn restore(&mut self, snap: CatalogSnapshot) {
-        self.tables = snap.0;
-        self.indexes = snap.1;
-        self.views = snap.2;
-        self.sequences = snap.3;
-        self.udfs = snap.4;
+        self.tables = snap.tables;
+        self.indexes = snap.indexes;
+        self.views = snap.views;
+        self.sequences = snap.sequences;
+        self.udfs = snap.udfs;
+        self.users = snap.users;
+        self.roles = snap.roles;
+        self.user_roles = snap.user_roles;
+        self.triggers = snap.triggers;
     }
 
     /// Enables or disables transaction mode.

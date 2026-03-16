@@ -289,9 +289,6 @@ pub struct PotatoDB {
     notification_queues: HashMap<String, VecDeque<String>>,
     cdc_log: VecDeque<CdcEvent>,
     cdc_capacity: usize,
-    users: HashMap<String, String>,
-    roles: HashMap<String, HashSet<String>>,
-    user_roles: HashMap<String, HashSet<String>>,
     current_user: String,
     snapshots: VecDeque<DbSnapshot>,
     snapshot_retention_ms: i64,
@@ -511,7 +508,7 @@ impl PotatoDB {
             ObjPath::from("catalog.json")
         };
 
-        let catalog = Catalog::load(store.clone(), catalog_obj_path).await?;
+        let mut catalog = Catalog::load(store.clone(), catalog_obj_path).await?;
 
         let (wal, arrow_wal, replay_entries, s3_wal_path, s3_wal_entries) = if is_s3 {
             let path = if s3_prefix.is_empty() {
@@ -576,12 +573,28 @@ impl PotatoDB {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(24 * 60 * 60 * 1000);
 
-        let mut users = HashMap::new();
-        users.insert(current_user.clone(), String::new());
-        let mut roles = HashMap::new();
-        roles.insert("admin".to_string(), HashSet::from(["ALL".to_string()]));
-        let mut user_roles = HashMap::new();
-        user_roles.insert(current_user.clone(), HashSet::from(["admin".to_string()]));
+        if catalog.users.is_empty() {
+            catalog.users.insert(
+                current_user.clone(),
+                potatodb_catalog::UserDef {
+                    name: current_user.clone(),
+                    password: String::new(),
+                },
+            );
+            catalog.roles.insert(
+                "admin".to_string(),
+                potatodb_catalog::RoleDef {
+                    name: "admin".to_string(),
+                    privileges: vec![potatodb_catalog::Privilege {
+                        kind: "ALL".to_string(),
+                        table: None,
+                    }],
+                },
+            );
+            catalog
+                .user_roles
+                .insert(current_user.clone(), vec!["admin".to_string()]);
+        }
 
         let mut db = Self {
             ctx,
@@ -613,9 +626,6 @@ impl PotatoDB {
             notification_queues: HashMap::new(),
             cdc_log: VecDeque::new(),
             cdc_capacity,
-            users,
-            roles,
-            user_roles,
             current_user,
             snapshots: VecDeque::new(),
             snapshot_retention_ms,
@@ -716,13 +726,15 @@ impl PotatoDB {
     /// Returns `(username, roles)` for every known user.
     #[must_use]
     pub fn user_info(&self) -> Vec<(String, Vec<String>)> {
-        self.users
+        self.catalog
+            .users
             .keys()
             .map(|u| {
                 let roles: Vec<String> = self
+                    .catalog
                     .user_roles
                     .get(u)
-                    .map(|rs| rs.iter().cloned().collect())
+                    .cloned()
                     .unwrap_or_default();
                 (u.clone(), roles)
             })
@@ -1737,22 +1749,22 @@ impl PotatoDB {
         }
 
         if upper.starts_with("CREATE USER ") {
-            let result = self.handle_create_user(trimmed);
+            let result = self.handle_create_user(trimmed).await;
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
         if upper.starts_with("CREATE ROLE ") {
-            let result = self.handle_create_role(trimmed);
+            let result = self.handle_create_role(trimmed).await;
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
         if upper.starts_with("GRANT ") {
-            let result = self.handle_grant(trimmed);
+            let result = self.handle_grant(trimmed).await;
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
         if upper.starts_with("REVOKE ") {
-            let result = self.handle_revoke(trimmed);
+            let result = self.handle_revoke(trimmed).await;
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
@@ -2317,14 +2329,38 @@ impl PotatoDB {
     }
 
     fn current_user_is_admin(&self) -> bool {
-        let Some(roles) = self.user_roles.get(&self.current_user) else {
+        let Some(role_names) = self.catalog.user_roles.get(&self.current_user) else {
             return false;
         };
-        roles.iter().any(|r| {
-            self.roles
-                .get(r)
-                .is_some_and(|privs| privs.contains("ALL") || privs.contains("*"))
+        role_names.iter().any(|r| {
+            self.catalog.roles.get(r).is_some_and(|role_def| {
+                role_def
+                    .privileges
+                    .iter()
+                    .any(|p| p.kind == "ALL" || p.kind == "*")
+            })
         })
+    }
+
+    fn user_has_privilege(&self, action: &str, table: Option<&str>) -> bool {
+        if self.current_user_is_admin() {
+            return true;
+        }
+        let Some(role_names) = self.catalog.user_roles.get(&self.current_user) else {
+            return false;
+        };
+        for rn in role_names {
+            if let Some(role_def) = self.catalog.roles.get(rn) {
+                for priv_entry in &role_def.privileges {
+                    if priv_entry.kind == "ALL" || priv_entry.kind == action {
+                        if priv_entry.table.is_none() || priv_entry.table.as_deref() == table {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn enforce_access(&self, sql: &str) -> Result<(), BoxError> {
@@ -2336,13 +2372,23 @@ impl PotatoDB {
             action.as_str(),
             "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "EXPLAIN"
         ) {
+            if !self.user_has_privilege("SELECT", None) {
+                return Err(format!(
+                    "permission denied for user '{}' on {}",
+                    self.current_user, action
+                )
+                .into());
+            }
             return Ok(());
         }
-        Err(format!(
-            "permission denied for user '{}' on statement '{}'",
-            self.current_user, action
-        )
-        .into())
+        if !self.user_has_privilege(&action, None) {
+            return Err(format!(
+                "permission denied for user '{}' on statement '{}'",
+                self.current_user, action
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn handle_select_cdc(&self, sql: &str) -> Result<QueryResult, BoxError> {
@@ -2528,7 +2574,7 @@ impl PotatoDB {
         )))
     }
 
-    fn handle_create_user(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+    async fn handle_create_user(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let tokens: Vec<&str> = sql
             .trim()
             .trim_end_matches(';')
@@ -2548,12 +2594,19 @@ impl PotatoDB {
                     .to_string()
             })
             .unwrap_or_default();
-        self.users.insert(name.clone(), password);
-        self.user_roles.entry(name.clone()).or_default();
+        self.catalog.users.insert(
+            name.clone(),
+            potatodb_catalog::UserDef {
+                name: name.clone(),
+                password,
+            },
+        );
+        self.catalog.user_roles.entry(name.clone()).or_default();
+        self.catalog.save().await?;
         Ok(QueryResult::Message(format!("User '{name}' created.")))
     }
 
-    fn handle_create_role(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+    async fn handle_create_role(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let tokens: Vec<&str> = sql
             .trim()
             .trim_end_matches(';')
@@ -2563,11 +2616,17 @@ impl PotatoDB {
             return Err("CREATE ROLE requires a name".into());
         }
         let role = tokens[2].trim_matches('"').to_string();
-        self.roles.entry(role.clone()).or_default();
+        self.catalog.roles.entry(role.clone()).or_insert_with(|| {
+            potatodb_catalog::RoleDef {
+                name: role.clone(),
+                privileges: Vec::new(),
+            }
+        });
+        self.catalog.save().await?;
         Ok(QueryResult::Message(format!("Role '{role}' created.")))
     }
 
-    fn handle_grant(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+    async fn handle_grant(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let tokens: Vec<&str> = sql
             .trim()
             .trim_end_matches(';')
@@ -2577,29 +2636,54 @@ impl PotatoDB {
             return Err("GRANT syntax: GRANT <PRIV> ON <TABLE> TO <ROLE|USER>".into());
         }
         let privilege = tokens[1].to_uppercase();
-        let role_or_user = tokens
+        let table_name = tokens[3].trim_matches('"').to_string();
+        let target = tokens
             .last()
             .copied()
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
-        if self.users.contains_key(&role_or_user) {
-            self.user_roles
-                .entry(role_or_user.clone())
-                .or_default()
-                .insert(privilege.clone());
+        let priv_entry = potatodb_catalog::Privilege {
+            kind: privilege.clone(),
+            table: Some(table_name),
+        };
+        if self.catalog.users.contains_key(&target) {
+            let role_name = format!("__user_{target}");
+            let role_def = self
+                .catalog
+                .roles
+                .entry(role_name.clone())
+                .or_insert_with(|| potatodb_catalog::RoleDef {
+                    name: role_name.clone(),
+                    privileges: Vec::new(),
+                });
+            if !role_def.privileges.contains(&priv_entry) {
+                role_def.privileges.push(priv_entry);
+            }
+            let user_role_list = self.catalog.user_roles.entry(target.clone()).or_default();
+            if !user_role_list.contains(&role_name) {
+                user_role_list.push(role_name);
+            }
         } else {
-            self.roles
-                .entry(role_or_user.clone())
-                .or_default()
-                .insert(privilege.clone());
+            let role_def = self
+                .catalog
+                .roles
+                .entry(target.clone())
+                .or_insert_with(|| potatodb_catalog::RoleDef {
+                    name: target.clone(),
+                    privileges: Vec::new(),
+                });
+            if !role_def.privileges.contains(&priv_entry) {
+                role_def.privileges.push(priv_entry);
+            }
         }
+        self.catalog.save().await?;
         Ok(QueryResult::Message(format!(
-            "Granted '{privilege}' to '{role_or_user}'."
+            "Granted '{privilege}' to '{target}'."
         )))
     }
 
-    fn handle_revoke(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+    async fn handle_revoke(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let tokens: Vec<&str> = sql
             .trim()
             .trim_end_matches(';')
@@ -2609,21 +2693,28 @@ impl PotatoDB {
             return Err("REVOKE syntax: REVOKE <PRIV> ON <TABLE> FROM <ROLE|USER>".into());
         }
         let privilege = tokens[1].to_uppercase();
-        let role_or_user = tokens
+        let table_name = tokens[3].trim_matches('"').to_string();
+        let target = tokens
             .last()
             .copied()
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
-        if self.users.contains_key(&role_or_user) {
-            if let Some(grants) = self.user_roles.get_mut(&role_or_user) {
-                grants.remove(&privilege);
+        if self.catalog.users.contains_key(&target) {
+            let role_name = format!("__user_{target}");
+            if let Some(role_def) = self.catalog.roles.get_mut(&role_name) {
+                role_def
+                    .privileges
+                    .retain(|p| !(p.kind == privilege && p.table.as_deref() == Some(&table_name)));
             }
-        } else if let Some(grants) = self.roles.get_mut(&role_or_user) {
-            grants.remove(&privilege);
+        } else if let Some(role_def) = self.catalog.roles.get_mut(&target) {
+            role_def
+                .privileges
+                .retain(|p| !(p.kind == privilege && p.table.as_deref() == Some(&table_name)));
         }
+        self.catalog.save().await?;
         Ok(QueryResult::Message(format!(
-            "Revoked '{privilege}' from '{role_or_user}'."
+            "Revoked '{privilege}' from '{target}'."
         )))
     }
 
