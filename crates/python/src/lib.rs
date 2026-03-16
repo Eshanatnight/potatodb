@@ -45,18 +45,20 @@ impl PyPotatoDB {
 #[pymethods]
 impl PyPotatoDB {
     #[staticmethod]
-    #[pyo3(signature = (path, s3_endpoint=None, s3_region=None, s3_allow_http=false))]
+    #[pyo3(signature = (path, s3_endpoint=None, s3_region=None, s3_allow_http=false, wal_dir=None))]
     fn open(
         path: String,
         s3_endpoint: Option<String>,
         s3_region: Option<String>,
         s3_allow_http: bool,
+        wal_dir: Option<String>,
     ) -> PyResult<Self> {
         let rt = Arc::new(Runtime::new().map_err(pyerr)?);
         let s3_config = path.starts_with("s3://").then_some(S3Config {
             endpoint: s3_endpoint,
             region: s3_region,
             allow_http: s3_allow_http,
+            wal_dir,
         });
         let db = rt.block_on(PotatoDB::new(path, s3_config)).map_err(pyerr)?;
         Ok(Self { rt, db: Some(db) })

@@ -1189,7 +1189,11 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, h)| {
-                let max_data = rows.iter().map(|r| r.get(i).map_or(0, String::len)).max().unwrap_or(0);
+                let max_data = rows
+                    .iter()
+                    .map(|r| r.get(i).map_or(0, String::len))
+                    .max()
+                    .unwrap_or(0);
                 h.len().max(max_data) as u16
             })
             .collect();

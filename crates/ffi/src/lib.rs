@@ -226,6 +226,7 @@ pub unsafe extern "C" fn potato_open(
     s3_endpoint: *const c_char,
     s3_region: *const c_char,
     s3_allow_http: bool,
+    wal_dir: *const c_char,
 ) -> *mut potato_db {
     let data_dir = match cstr_to_str(data_dir) {
         Some(s) => s.to_string(),
@@ -237,6 +238,7 @@ pub unsafe extern "C" fn potato_open(
             endpoint: cstr_to_str(s3_endpoint).map(String::from),
             region: cstr_to_str(s3_region).map(String::from),
             allow_http: s3_allow_http,
+            wal_dir: cstr_to_str(wal_dir).map(String::from),
         })
     } else {
         None
@@ -267,7 +269,7 @@ pub unsafe extern "C" fn potato_open(
 /// their corresponding free/close function and not used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn potato_open_local(data_dir: *const c_char) -> *mut potato_db {
-    potato_open(data_dir, ptr::null(), ptr::null(), false)
+    potato_open(data_dir, ptr::null(), ptr::null(), false, ptr::null())
 }
 
 /// Closes the database and frees all associated memory.

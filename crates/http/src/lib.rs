@@ -78,8 +78,10 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let functions_total = db.function_names().len();
     let users_total = db.user_info().len();
 
+    drop(db);
+
     let body = format!(
-        r#"# HELP potatodb_tables_total Number of tables
+        r"# HELP potatodb_tables_total Number of tables
 # TYPE potatodb_tables_total gauge
 potatodb_tables_total {tables_total}
 # HELP potatodb_indexes_total Number of indexes
@@ -97,7 +99,7 @@ potatodb_functions_total {functions_total}
 # HELP potatodb_users_total Number of users
 # TYPE potatodb_users_total gauge
 potatodb_users_total {users_total}
-"#
+"
     );
 
     (
@@ -142,7 +144,6 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         .await;
 
     // Poll for CDC events every second
-    let mut _last_seen = 0i64;
     loop {
         tokio::select! {
             msg = socket.recv() => {
@@ -159,10 +160,9 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                 // Poll CDC events
                 let db = state.db.read().await;
-                let _sql = "SELECT * FROM potatodb_cdc";
                 drop(db);
                 // For now just send a heartbeat
                 let _ = socket
@@ -394,9 +394,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/query")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        "{\"sql\":\"SELECT * FROM nonexistent_table;\"}",
-                    ))
+                    .body(Body::from("{\"sql\":\"SELECT * FROM nonexistent_table;\"}"))
                     .unwrap(),
             )
             .await
@@ -415,9 +413,7 @@ mod tests {
         {
             let mut db = db.write().await;
             db.execute("CREATE TABLE stats_t (id INT);").await.unwrap();
-            db.execute("INSERT INTO stats_t VALUES (1);")
-                .await
-                .unwrap();
+            db.execute("INSERT INTO stats_t VALUES (1);").await.unwrap();
         }
 
         let resp = app

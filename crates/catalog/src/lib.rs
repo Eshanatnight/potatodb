@@ -297,7 +297,7 @@ pub struct Catalog {
     pub triggers: HashMap<String, TriggerDef>,
     /// Schema version number for migrations.
     pub schema_version: u64,
-    /// Migration records (version, description, SQL, applied_at_ms).
+    /// Migration records (version, description, SQL, `applied_at_ms`).
     pub migrations: Vec<MigrationRecord>,
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
@@ -345,8 +345,7 @@ impl Catalog {
                         dirty: false,
                     })
                 } else {
-                    let tables: HashMap<String, TableMeta> =
-                        serde_json::from_slice(&bytes)?;
+                    let tables: HashMap<String, TableMeta> = serde_json::from_slice(&bytes)?;
                     Ok(Self {
                         tables,
                         indexes: HashMap::new(),

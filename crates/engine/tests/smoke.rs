@@ -2991,11 +2991,9 @@ async fn test_do_block_declare_and_variables() {
     }
 
     // RAISE NOTICE is a no-op
-    db.execute(
-        r#"DO $$ BEGIN RAISE NOTICE 'test message'; END; $$;"#,
-    )
-    .await
-    .unwrap();
+    db.execute(r#"DO $$ BEGIN RAISE NOTICE 'test message'; END; $$;"#)
+        .await
+        .unwrap();
 }
 
 // ── Phase 1.1: Engine accessor methods (backing TUI meta-commands) ──
@@ -3134,11 +3132,7 @@ async fn test_savepoint_and_rollback_to() {
 
     db.execute("ROLLBACK TO s1;").await.unwrap();
 
-    let batches = expect_records(
-        db.execute("SELECT COUNT(*) AS n FROM sp_t;")
-            .await
-            .unwrap(),
-    );
+    let batches = expect_records(db.execute("SELECT COUNT(*) AS n FROM sp_t;").await.unwrap());
     let cnt = batches[0]
         .column(0)
         .as_any()
@@ -3152,11 +3146,7 @@ async fn test_savepoint_and_rollback_to() {
 
     db.execute("COMMIT;").await.unwrap();
 
-    let batches = expect_records(
-        db.execute("SELECT COUNT(*) AS n FROM sp_t;")
-            .await
-            .unwrap(),
-    );
+    let batches = expect_records(db.execute("SELECT COUNT(*) AS n FROM sp_t;").await.unwrap());
     let cnt = batches[0]
         .column(0)
         .as_any()
@@ -3298,10 +3288,7 @@ async fn test_create_trigger_after_delete() {
     db.execute("DELETE FROM del_t WHERE id = 1;").await.unwrap();
 
     let batches = expect_records(db.execute("SELECT * FROM del_log;").await.unwrap());
-    assert!(
-        row_count(&batches) >= 1,
-        "AFTER DELETE trigger should fire"
-    );
+    assert!(row_count(&batches) >= 1, "AFTER DELETE trigger should fire");
 }
 
 #[tokio::test]
@@ -3358,7 +3345,11 @@ async fn test_merge_insert_not_matched() {
             .await
             .unwrap(),
     );
-    assert_eq!(row_count(&batches), 3, "MERGE should insert 2 new rows + 1 existing");
+    assert_eq!(
+        row_count(&batches),
+        3,
+        "MERGE should insert 2 new rows + 1 existing"
+    );
 
     let ids = batches[0]
         .column(0)
@@ -3377,16 +3368,12 @@ async fn test_merge_delete_matched() {
         .await
         .unwrap();
 
-    db.execute("CREATE TABLE mdel_tgt (id INT);")
-        .await
-        .unwrap();
+    db.execute("CREATE TABLE mdel_tgt (id INT);").await.unwrap();
     db.execute("INSERT INTO mdel_tgt VALUES (1), (2), (3);")
         .await
         .unwrap();
 
-    db.execute("CREATE TABLE mdel_src (id INT);")
-        .await
-        .unwrap();
+    db.execute("CREATE TABLE mdel_src (id INT);").await.unwrap();
     db.execute("INSERT INTO mdel_src VALUES (2);")
         .await
         .unwrap();
@@ -3465,7 +3452,11 @@ async fn test_create_migration_and_migrate() {
     );
 
     let batches = expect_records(db.execute("SELECT * FROM mig_users;").await.unwrap());
-    assert_eq!(row_count(&batches), 1, "migration should have created and seeded the table");
+    assert_eq!(
+        row_count(&batches),
+        1,
+        "migration should have created and seeded the table"
+    );
 
     let msg = expect_message(db.execute("MIGRATE;").await.unwrap());
     assert!(
@@ -3583,10 +3574,7 @@ async fn test_pg_catalog_pg_attribute() {
             .await
             .unwrap(),
     );
-    assert!(
-        row_count(&batches) >= 2,
-        "pg_attribute should list columns"
-    );
+    assert!(row_count(&batches) >= 2, "pg_attribute should list columns");
 }
 
 // ── Phase 4.3: FTS inverted index ─────────────────────────────
@@ -3601,14 +3589,14 @@ async fn test_fts_inverted_index_insert_and_query() {
     db.execute("CREATE TABLE articles (id INT, title VARCHAR, body VARCHAR);")
         .await
         .unwrap();
-    db.execute("INSERT INTO articles VALUES (1, 'Rust Programming', 'Rust is a systems language');")
-        .await
-        .unwrap();
     db.execute(
-        "INSERT INTO articles VALUES (2, 'Python Guide', 'Python is great for scripting');",
+        "INSERT INTO articles VALUES (1, 'Rust Programming', 'Rust is a systems language');",
     )
     .await
     .unwrap();
+    db.execute("INSERT INTO articles VALUES (2, 'Python Guide', 'Python is great for scripting');")
+        .await
+        .unwrap();
     db.execute("INSERT INTO articles VALUES (3, 'Rust Async', 'Async rust with tokio');")
         .await
         .unwrap();
@@ -3717,11 +3705,9 @@ async fn test_migration_persists_across_restarts() {
         let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
             .await
             .unwrap();
-        db.execute(
-            "CREATE MIGRATION 1 init AS $$ CREATE TABLE mig_persist (x INT); $$;",
-        )
-        .await
-        .unwrap();
+        db.execute("CREATE MIGRATION 1 init AS $$ CREATE TABLE mig_persist (x INT); $$;")
+            .await
+            .unwrap();
         db.execute("MIGRATE;").await.unwrap();
     }
 
