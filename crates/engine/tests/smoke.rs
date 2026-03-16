@@ -1,7 +1,25 @@
-use arrow::array::{Array, Int32Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 use chrono::Utc;
 use potatodb_engine::{PotatoDB, QueryResult};
 use potatodb_wal::{EntryStatus, Wal, WalEntry};
+
+fn row_count(batches: &[arrow::record_batch::RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+fn expect_records(result: QueryResult) -> Vec<arrow::record_batch::RecordBatch> {
+    match result {
+        QueryResult::Records(b) => b,
+        QueryResult::Message(m) => panic!("expected records, got message: {m}"),
+    }
+}
+
+fn expect_message(result: QueryResult) -> String {
+    match result {
+        QueryResult::Message(m) => m,
+        QueryResult::Records(_) => panic!("expected message, got records"),
+    }
+}
 
 #[tokio::test]
 async fn test_create_insert_select_drop() {
@@ -2978,4 +2996,745 @@ async fn test_do_block_declare_and_variables() {
     )
     .await
     .unwrap();
+}
+
+// ── Phase 1.1: Engine accessor methods (backing TUI meta-commands) ──
+
+#[tokio::test]
+async fn test_sequence_names_accessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    assert!(db.sequence_names().is_empty());
+    db.execute("CREATE SEQUENCE test_seq;").await.unwrap();
+    let names = db.sequence_names();
+    assert!(names.contains(&"test_seq".to_string()));
+    db.execute("DROP SEQUENCE test_seq;").await.unwrap();
+    assert!(!db.sequence_names().contains(&"test_seq".to_string()));
+}
+
+#[tokio::test]
+async fn test_user_info_accessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    let info = db.user_info();
+    assert!(!info.is_empty(), "default user should exist");
+
+    db.execute("CREATE USER testuser WITH PASSWORD 'pass';")
+        .await
+        .unwrap();
+    let info = db.user_info();
+    assert!(
+        info.iter().any(|(u, _)| u == "testuser"),
+        "testuser should appear in user_info"
+    );
+}
+
+// ── Phase 1.2: EXPLAIN ANALYZE ────────────────────────────────
+
+#[tokio::test]
+async fn test_explain_analyze_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE ea_t (id INT);").await.unwrap();
+    db.execute("INSERT INTO ea_t VALUES (1);").await.unwrap();
+
+    let batches = expect_records(
+        db.execute("EXPLAIN ANALYZE SELECT * FROM ea_t;")
+            .await
+            .unwrap(),
+    );
+    assert!(!batches.is_empty(), "EXPLAIN ANALYZE should return rows");
+
+    let batches = expect_records(
+        db.execute("EXPLAIN (ANALYZE) SELECT * FROM ea_t;")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !batches.is_empty(),
+        "EXPLAIN (ANALYZE) should also return rows"
+    );
+}
+
+#[tokio::test]
+async fn test_query_metrics_accessor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE qm_t (id INT);").await.unwrap();
+    db.execute("INSERT INTO qm_t VALUES (1);").await.unwrap();
+    db.execute("SELECT * FROM qm_t;").await.unwrap();
+
+    let metrics = db.last_query_metrics();
+    assert_eq!(metrics.parquet_files_read, 0);
+}
+
+// ── Phase 1.3: RBAC persistence ──────────────────────────────
+
+#[tokio::test]
+async fn test_rbac_persists_across_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        db.execute("CREATE USER persisted_user WITH PASSWORD 'secret';")
+            .await
+            .unwrap();
+        db.execute("CREATE ROLE dev_role;").await.unwrap();
+        db.execute("CREATE TABLE rbac_t (id INT);").await.unwrap();
+        db.execute("GRANT SELECT ON rbac_t TO dev_role;")
+            .await
+            .unwrap();
+    }
+
+    {
+        let db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        let info = db.user_info();
+        assert!(
+            info.iter().any(|(u, _)| u == "persisted_user"),
+            "user should persist: {info:?}"
+        );
+    }
+}
+
+// ── Phase 2.1: SAVEPOINT ──────────────────────────────────────
+
+#[tokio::test]
+async fn test_savepoint_and_rollback_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE sp_t (id INT);").await.unwrap();
+    db.execute("INSERT INTO sp_t VALUES (1);").await.unwrap();
+
+    db.execute("BEGIN;").await.unwrap();
+    db.execute("INSERT INTO sp_t VALUES (2);").await.unwrap();
+    db.execute("SAVEPOINT s1;").await.unwrap();
+    db.execute("INSERT INTO sp_t VALUES (3);").await.unwrap();
+    db.execute("SAVEPOINT s2;").await.unwrap();
+    db.execute("INSERT INTO sp_t VALUES (4);").await.unwrap();
+
+    db.execute("ROLLBACK TO s1;").await.unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT COUNT(*) AS n FROM sp_t;")
+            .await
+            .unwrap(),
+    );
+    let cnt = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        cnt.value(0),
+        2,
+        "after ROLLBACK TO s1: original row + row before s1"
+    );
+
+    db.execute("COMMIT;").await.unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT COUNT(*) AS n FROM sp_t;")
+            .await
+            .unwrap(),
+    );
+    let cnt = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(cnt.value(0), 2);
+}
+
+#[tokio::test]
+async fn test_release_savepoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE rs_t (id INT);").await.unwrap();
+    db.execute("BEGIN;").await.unwrap();
+    db.execute("INSERT INTO rs_t VALUES (1);").await.unwrap();
+    db.execute("SAVEPOINT sp1;").await.unwrap();
+    db.execute("INSERT INTO rs_t VALUES (2);").await.unwrap();
+
+    let msg = expect_message(db.execute("RELEASE SAVEPOINT sp1;").await.unwrap());
+    assert!(msg.contains("RELEASE SAVEPOINT"), "got: {msg}");
+
+    db.execute("COMMIT;").await.unwrap();
+
+    let batches = expect_records(db.execute("SELECT * FROM rs_t;").await.unwrap());
+    assert_eq!(row_count(&batches), 2);
+}
+
+// ── Phase 2.2: Deletion vectors ───────────────────────────────
+
+#[tokio::test]
+async fn test_deletion_vector_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE dv_t (id INT);").await.unwrap();
+    db.execute("INSERT INTO dv_t VALUES (1), (2), (3);")
+        .await
+        .unwrap();
+
+    assert_eq!(db.deletion_vector_count("dv_t"), 0);
+    assert_eq!(db.deletion_vector_count("nonexistent"), 0);
+
+    db.execute("DELETE FROM dv_t WHERE id = 2;").await.unwrap();
+    assert_eq!(
+        db.deletion_vector_count("dv_t"),
+        0,
+        "rewrite clears deletion vectors"
+    );
+}
+
+// ── Phase 2.3: Durable CDC ────────────────────────────────────
+
+#[tokio::test]
+async fn test_cdc_persists_across_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        db.execute("CREATE TABLE cdc_t (id INT);").await.unwrap();
+        db.execute("INSERT INTO cdc_t VALUES (1);").await.unwrap();
+        db.execute("INSERT INTO cdc_t VALUES (2);").await.unwrap();
+    }
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        let batches = expect_records(
+            db.execute("SELECT * FROM potatodb_cdc WHERE table = 'cdc_t';")
+                .await
+                .unwrap(),
+        );
+        assert!(
+            row_count(&batches) >= 2,
+            "CDC events should persist: got {}",
+            row_count(&batches)
+        );
+    }
+}
+
+// ── Phase 2.4: Triggers ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_create_trigger_before_insert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE audit_log (msg VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE trig_t (id INT);").await.unwrap();
+
+    db.execute(
+        "CREATE TRIGGER trg_before BEFORE INSERT ON trig_t \
+         EXECUTE $$ INSERT INTO audit_log VALUES ('before_insert'); $$;",
+    )
+    .await
+    .unwrap();
+
+    db.execute("INSERT INTO trig_t VALUES (1);").await.unwrap();
+
+    let batches = expect_records(db.execute("SELECT * FROM audit_log;").await.unwrap());
+    assert!(
+        row_count(&batches) >= 1,
+        "BEFORE INSERT trigger should fire"
+    );
+}
+
+#[tokio::test]
+async fn test_create_trigger_after_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE del_log (msg VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE del_t (id INT);").await.unwrap();
+    db.execute("INSERT INTO del_t VALUES (1);").await.unwrap();
+
+    db.execute(
+        "CREATE TRIGGER trg_after_del AFTER DELETE ON del_t \
+         EXECUTE $$ INSERT INTO del_log VALUES ('after_delete'); $$;",
+    )
+    .await
+    .unwrap();
+
+    db.execute("DELETE FROM del_t WHERE id = 1;").await.unwrap();
+
+    let batches = expect_records(db.execute("SELECT * FROM del_log;").await.unwrap());
+    assert!(
+        row_count(&batches) >= 1,
+        "AFTER DELETE trigger should fire"
+    );
+}
+
+#[tokio::test]
+async fn test_drop_trigger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE dt_t (id INT);").await.unwrap();
+    db.execute(
+        "CREATE TRIGGER dt_trg BEFORE INSERT ON dt_t \
+         EXECUTE $$ SELECT 1; $$;",
+    )
+    .await
+    .unwrap();
+
+    let msg = expect_message(db.execute("DROP TRIGGER dt_trg;").await.unwrap());
+    assert!(msg.contains("dropped"), "got: {msg}");
+}
+
+// ── Phase 2.5: MERGE statement ────────────────────────────────
+
+#[tokio::test]
+async fn test_merge_insert_not_matched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE target (id INT, val VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO target VALUES (1, 'existing');")
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE src (id INT, val VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO src VALUES (2, 'new'), (3, 'also_new');")
+        .await
+        .unwrap();
+
+    db.execute(
+        "MERGE INTO target USING src ON target.id = src.id \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (src.id, src.val);",
+    )
+    .await
+    .unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT id, val FROM target ORDER BY id;")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(row_count(&batches), 3, "MERGE should insert 2 new rows + 1 existing");
+
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(ids.value(1), 2);
+    assert_eq!(ids.value(2), 3);
+}
+
+#[tokio::test]
+async fn test_merge_delete_matched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE mdel_tgt (id INT);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO mdel_tgt VALUES (1), (2), (3);")
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE mdel_src (id INT);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO mdel_src VALUES (2);")
+        .await
+        .unwrap();
+
+    db.execute(
+        "MERGE INTO mdel_tgt USING mdel_src ON mdel_tgt.id = mdel_src.id \
+         WHEN MATCHED THEN DELETE;",
+    )
+    .await
+    .unwrap();
+
+    let batches = expect_records(db.execute("SELECT * FROM mdel_tgt;").await.unwrap());
+    assert_eq!(
+        row_count(&batches),
+        2,
+        "MERGE DELETE should remove 1 row, leaving 2"
+    );
+}
+
+// ── Phase 3.4: Plan cache stats ───────────────────────────────
+
+#[tokio::test]
+async fn test_plan_cache_stats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE pc_t (id INT);").await.unwrap();
+    db.execute("INSERT INTO pc_t VALUES (1);").await.unwrap();
+
+    db.execute("SELECT * FROM pc_t;").await.unwrap();
+    db.execute("SELECT * FROM pc_t;").await.unwrap();
+    db.execute("SELECT * FROM pc_t;").await.unwrap();
+
+    let (cache_size, hits) = db.plan_cache_stats();
+    assert!(cache_size >= 1, "cache should have entries");
+    assert!(hits >= 1, "should have at least 1 cache hit, got {hits}");
+}
+
+// ── Phase 5.3: Migrations ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_create_migration_and_migrate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    let msg = expect_message(
+        db.execute(
+            "CREATE MIGRATION 1 add_users_table AS $$ \
+             CREATE TABLE mig_users (id INT, name VARCHAR); \
+             $$;",
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(msg.contains("registered"), "got: {msg}");
+
+    let msg = expect_message(
+        db.execute(
+            "CREATE MIGRATION 2 seed_data AS $$ \
+             INSERT INTO mig_users VALUES (1, 'seed'); \
+             $$;",
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(msg.contains("registered"), "got: {msg}");
+
+    let msg = expect_message(db.execute("MIGRATE;").await.unwrap());
+    assert!(
+        msg.contains("Applied 2 migration(s)") || msg.contains("applied"),
+        "got: {msg}"
+    );
+
+    let batches = expect_records(db.execute("SELECT * FROM mig_users;").await.unwrap());
+    assert_eq!(row_count(&batches), 1, "migration should have created and seeded the table");
+
+    let msg = expect_message(db.execute("MIGRATE;").await.unwrap());
+    assert!(
+        msg.contains("0") || msg.to_lowercase().contains("up to date"),
+        "re-running should be idempotent, got: {msg}"
+    );
+}
+
+// ── Phase 5.4: Replication metadata ───────────────────────────
+
+#[tokio::test]
+async fn test_add_and_remove_replica() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    let msg = expect_message(
+        db.execute("ADD REPLICA 'http://replica1:5432';")
+            .await
+            .unwrap(),
+    );
+    assert!(msg.to_lowercase().contains("added"), "got: {msg}");
+
+    let replicas = db.replica_urls();
+    assert_eq!(replicas.len(), 1);
+    assert_eq!(replicas[0], "http://replica1:5432");
+
+    let msg = expect_message(
+        db.execute("ADD REPLICA 'http://replica2:5432';")
+            .await
+            .unwrap(),
+    );
+    assert!(msg.to_lowercase().contains("added"), "got: {msg}");
+    assert_eq!(db.replica_urls().len(), 2);
+
+    let msg = expect_message(
+        db.execute("REMOVE REPLICA 'http://replica1:5432';")
+            .await
+            .unwrap(),
+    );
+    assert!(msg.to_lowercase().contains("removed"), "got: {msg}");
+    assert_eq!(db.replica_urls().len(), 1);
+}
+
+// ── Phase 5.5: pg_catalog virtual tables ──────────────────────
+
+#[tokio::test]
+async fn test_pg_catalog_pg_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT * FROM pg_catalog.pg_type;")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        row_count(&batches) >= 5,
+        "pg_type should return standard types"
+    );
+}
+
+#[tokio::test]
+async fn test_pg_catalog_pg_namespace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT * FROM pg_catalog.pg_namespace;")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        row_count(&batches) >= 1,
+        "pg_namespace should have at least 'public'"
+    );
+}
+
+#[tokio::test]
+async fn test_pg_catalog_pg_class() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE pg_test (id INT);").await.unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT * FROM pg_catalog.pg_class;")
+            .await
+            .unwrap(),
+    );
+    let total = row_count(&batches);
+    assert!(total >= 1, "pg_class should list tables, got {total}");
+}
+
+#[tokio::test]
+async fn test_pg_catalog_pg_attribute() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE attr_t (id INT, name VARCHAR);")
+        .await
+        .unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT * FROM pg_catalog.pg_attribute;")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        row_count(&batches) >= 2,
+        "pg_attribute should list columns"
+    );
+}
+
+// ── Phase 4.3: FTS inverted index ─────────────────────────────
+
+#[tokio::test]
+async fn test_fts_inverted_index_insert_and_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE articles (id INT, title VARCHAR, body VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO articles VALUES (1, 'Rust Programming', 'Rust is a systems language');")
+        .await
+        .unwrap();
+    db.execute(
+        "INSERT INTO articles VALUES (2, 'Python Guide', 'Python is great for scripting');",
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO articles VALUES (3, 'Rust Async', 'Async rust with tokio');")
+        .await
+        .unwrap();
+
+    db.execute("CREATE FULLTEXT INDEX idx_articles ON articles(title, body);")
+        .await
+        .unwrap();
+
+    let batches = expect_records(
+        db.execute("SELECT id FROM articles WHERE fts_match('rust') ORDER BY id;")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        row_count(&batches) >= 2,
+        "fts_match('rust') should match at least 2 articles"
+    );
+}
+
+// ── Phase 1.4 + 5.1: Additional engine behavior tests ─────────
+
+#[tokio::test]
+async fn test_trigger_persists_across_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        db.execute("CREATE TABLE tp_log (msg VARCHAR);")
+            .await
+            .unwrap();
+        db.execute("CREATE TABLE tp_t (id INT);").await.unwrap();
+        db.execute(
+            "CREATE TRIGGER tp_trg AFTER INSERT ON tp_t \
+             EXECUTE $$ INSERT INTO tp_log VALUES ('fired'); $$;",
+        )
+        .await
+        .unwrap();
+    }
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO tp_t VALUES (1);").await.unwrap();
+
+        let batches = expect_records(db.execute("SELECT * FROM tp_log;").await.unwrap());
+        assert!(
+            row_count(&batches) >= 1,
+            "trigger should fire after restart"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_savepoint_outside_transaction_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    let err = db.execute("SAVEPOINT sp1;").await;
+    assert!(err.is_err(), "SAVEPOINT outside BEGIN should fail");
+}
+
+#[tokio::test]
+async fn test_merge_no_match_insert_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+
+    db.execute("CREATE TABLE m_tgt (id INT, name VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE m_src (id INT, name VARCHAR);")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO m_src VALUES (1, 'a'), (2, 'b');")
+        .await
+        .unwrap();
+
+    db.execute(
+        "MERGE INTO m_tgt USING m_src ON m_tgt.id = m_src.id \
+         WHEN NOT MATCHED THEN INSERT (id, name) VALUES (m_src.id, m_src.name);",
+    )
+    .await
+    .unwrap();
+
+    let batches = expect_records(db.execute("SELECT * FROM m_tgt;").await.unwrap());
+    assert_eq!(
+        row_count(&batches),
+        2,
+        "MERGE INSERT-only should add 2 rows"
+    );
+}
+
+#[tokio::test]
+async fn test_migration_persists_across_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE MIGRATION 1 init AS $$ CREATE TABLE mig_persist (x INT); $$;",
+        )
+        .await
+        .unwrap();
+        db.execute("MIGRATE;").await.unwrap();
+    }
+
+    {
+        let mut db = PotatoDB::new(data_dir.to_string_lossy().to_string(), None)
+            .await
+            .unwrap();
+        let msg = expect_message(db.execute("MIGRATE;").await.unwrap());
+        assert!(
+            msg.contains("0") || msg.to_lowercase().contains("up to date"),
+            "already-applied migration should not re-run, got: {msg}"
+        );
+        let batches = expect_records(db.execute("SELECT * FROM mig_persist;").await.unwrap());
+        assert_eq!(row_count(&batches), 0);
+    }
 }

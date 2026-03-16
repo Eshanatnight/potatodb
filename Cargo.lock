@@ -3683,6 +3683,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "axum",
+ "http-body-util",
  "potatodb-display",
  "potatodb-engine",
  "serde",

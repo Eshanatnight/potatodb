@@ -864,6 +864,11 @@ impl PotatoDB {
             .unwrap_or(0)
     }
 
+    #[must_use]
+    pub fn replica_urls(&self) -> &[String] {
+        &self.replicas
+    }
+
     /// Returns the number of parquet files currently backing a table.
     ///
     /// # Errors
@@ -3038,7 +3043,7 @@ impl PotatoDB {
         } else {
             return Err("CREATE TRIGGER requires INSERT, UPDATE, or DELETE".into());
         };
-        let after_event = after_timing[event.len()..].trim();
+        let after_event = &after_timing[event.len()..];
         let on_idx = find_ci(after_event, " ON ").ok_or("CREATE TRIGGER requires ON")?;
         let table_part = after_event[on_idx + 4..].trim();
         let exec_idx =

@@ -211,16 +211,22 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
+    use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
-    #[tokio::test]
-    async fn test_http_routes_health_tables_and_query() {
+    async fn setup() -> (Arc<RwLock<PotatoDB>>, Router, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None)
             .await
             .unwrap();
         let db = Arc::new(RwLock::new(db));
         let app = build_router(db.clone());
+        (db, app, tmp)
+    }
+
+    #[tokio::test]
+    async fn test_http_routes_health_tables_and_query() {
+        let (db, app, _tmp) = setup().await;
 
         let health = app
             .clone()
@@ -270,5 +276,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(query.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_returns_prometheus_format() {
+        let (db, app, _tmp) = setup().await;
+
+        {
+            let mut db = db.write().await;
+            db.execute("CREATE TABLE metrics_t1 (id INT);")
+                .await
+                .unwrap();
+            db.execute("CREATE TABLE metrics_t2 (id INT);")
+                .await
+                .unwrap();
+            db.execute("CREATE VIEW metrics_v AS SELECT * FROM metrics_t1;")
+                .await
+                .unwrap();
+            db.execute("CREATE SEQUENCE metrics_seq;").await.unwrap();
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            text.contains("potatodb_tables_total"),
+            "should contain tables metric"
+        );
+        assert!(
+            text.contains("potatodb_indexes_total"),
+            "should contain indexes metric"
+        );
+        assert!(
+            text.contains("potatodb_views_total"),
+            "should contain views metric"
+        );
+        assert!(
+            text.contains("potatodb_sequences_total"),
+            "should contain sequences metric"
+        );
+        assert!(
+            text.contains("potatodb_functions_total"),
+            "should contain functions metric"
+        );
+        assert!(
+            text.contains("potatodb_users_total"),
+            "should contain users metric"
+        );
+
+        assert!(text.contains("# HELP"), "should contain HELP comments");
+        assert!(text.contains("# TYPE"), "should contain TYPE comments");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_counts_are_accurate() {
+        let (db, app, _tmp) = setup().await;
+
+        {
+            let mut db = db.write().await;
+            db.execute("CREATE TABLE m_t1 (id INT);").await.unwrap();
+            db.execute("INSERT INTO m_t1 VALUES (1);").await.unwrap();
+            db.execute("CREATE INDEX m_idx ON m_t1 (id);")
+                .await
+                .unwrap();
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        for line in text.lines() {
+            if line.starts_with("potatodb_tables_total") {
+                let val: usize = line.split_whitespace().last().unwrap().parse().unwrap();
+                assert!(val >= 1, "should have at least 1 table");
+            }
+            if line.starts_with("potatodb_indexes_total") {
+                let val: usize = line.split_whitespace().last().unwrap().parse().unwrap();
+                assert!(val >= 1, "should have at least 1 index");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_endpoint_error_handling() {
+        let (_db, app, _tmp) = setup().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        "{\"sql\":\"SELECT * FROM nonexistent_table;\"}",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "error");
+    }
+
+    #[tokio::test]
+    async fn test_table_stats_endpoint() {
+        let (db, app, _tmp) = setup().await;
+
+        {
+            let mut db = db.write().await;
+            db.execute("CREATE TABLE stats_t (id INT);").await.unwrap();
+            db.execute("INSERT INTO stats_t VALUES (1);")
+                .await
+                .unwrap();
+        }
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/tables/stats_t/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["table"], "stats_t");
     }
 }
