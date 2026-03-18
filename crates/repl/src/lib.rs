@@ -6,8 +6,10 @@
 
 use std::borrow::Cow;
 
-use chrono::Utc;
+use std::time::Instant;
+
 use rustyline::completion::{Completer, Pair};
+
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
@@ -36,7 +38,7 @@ const BANNER: &str = r"
 
 Type SQL statements terminated with ';'
 Special commands: \q, \dt, \d <table>, \di, \dv, \i <file>, .source <file>,
-                  \backup, \restore, .import, .export
+                  \backup, \restore, .import, .export, \timing
 ";
 
 #[derive(Clone, Default)]
@@ -130,6 +132,7 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
     println!("{BANNER}");
 
     let mut buffer = String::new();
+    let mut show_timing = false;
 
     loop {
         let prompt = if buffer.is_empty() {
@@ -147,8 +150,13 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                         "\\q" | "quit" | "exit" => {
                             break;
                         }
+                        "\\timing" => {
+                            show_timing = !show_timing;
+                            println!("Timing is {}.", if show_timing { "on" } else { "off" });
+                            continue;
+                        }
                         "\\dt" => {
-                            execute_and_print(db, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name").await;
+                            execute_and_print(db, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name", show_timing).await;
                             continue;
                         }
                         "\\di" => {
@@ -180,7 +188,7 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                         }
                         s if s.starts_with("\\d ") => {
                             let table = s[3..].trim();
-                            execute_and_print(db, &format!("DESCRIBE {table}")).await;
+                            execute_and_print(db, &format!("DESCRIBE {table}"), show_timing).await;
                             continue;
                         }
                         s if s.starts_with("\\i ") || s.starts_with(".source ") => {
@@ -191,7 +199,7 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                             } else {
                                 unreachable!()
                             };
-                            execute_file_and_print(db, path).await;
+                            execute_file_and_print(db, path, show_timing).await;
                             if let Some(helper) = rl.helper_mut() {
                                 helper.words = completion_words(db);
                             }
@@ -199,7 +207,7 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                         }
                         s if s.starts_with(".import ") => {
                             if let Some(sql) = parse_io_command(s, true) {
-                                execute_and_print(db, &sql).await;
+                                execute_and_print(db, &sql, show_timing).await;
                             } else {
                                 eprintln!("Usage: .import <csv|json|parquet> <table> <path>");
                             }
@@ -207,7 +215,7 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                         }
                         s if s.starts_with(".export ") => {
                             if let Some(sql) = parse_io_command(s, false) {
-                                execute_and_print(db, &sql).await;
+                                execute_and_print(db, &sql, show_timing).await;
                             } else {
                                 eprintln!("Usage: .export <csv|json|parquet> <table> <path>");
                             }
@@ -230,7 +238,7 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
                 if effective.ends_with(';') {
                     let sql = buffer.trim().to_string();
                     let _ = rl.add_history_entry(&sql);
-                    execute_and_print(db, &sql).await;
+                    execute_and_print(db, &sql, show_timing).await;
                     buffer.clear();
                     if let Some(helper) = rl.helper_mut() {
                         helper.words = completion_words(db);
@@ -252,48 +260,84 @@ pub async fn run(db: &mut PotatoDB) -> Result<(), Box<dyn std::error::Error + Se
 }
 
 /// Executes a SQL statement and prints the results or error to stdout.
-async fn execute_and_print(db: &mut PotatoDB, sql: &str) {
-    let start = Utc::now();
+///
+/// When `timing` is true, an additional `Time: X.XXX ms` line is
+/// printed together with I/O metrics after each query (like psql's
+/// `\timing`).
+async fn execute_and_print(db: &mut PotatoDB, sql: &str, timing: bool) {
+    let start = Instant::now();
     match db.execute(sql).await {
         Ok(QueryResult::Records(batches)) => {
-            let elapsed = Utc::now() - start;
+            let elapsed = start.elapsed();
+            let metrics = db.last_query_metrics();
             println!("{}", display::format_batches_truncated(&batches));
-            println!(
-                "({} row(s), {}ms)",
-                display::row_count(&batches),
-                elapsed.num_milliseconds()
-            );
+            println!("({} row(s))", display::row_count(&batches));
+            if timing {
+                print_timing(elapsed, metrics);
+            }
         }
         Ok(QueryResult::Message(msg)) => {
-            let elapsed = Utc::now() - start;
+            let elapsed = start.elapsed();
+            let metrics = db.last_query_metrics();
             println!("{msg}");
-            println!("({elapsed})");
+            if timing {
+                print_timing(elapsed, metrics);
+            }
         }
         Err(e) => {
+            let elapsed = start.elapsed();
             eprintln!("ERROR: {e}");
+            if timing {
+                println!("Time: {:.3} ms", elapsed.as_secs_f64() * 1000.0);
+            }
         }
     }
     println!();
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn print_timing(elapsed: std::time::Duration, metrics: &potatodb_engine::QueryMetrics) {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if metrics.parquet_files_read > 0 || metrics.bytes_scanned > 0 {
+        let kb = metrics.bytes_scanned as f64 / 1024.0;
+        println!(
+            "Time: {ms:.3} ms  (files read: {}, scanned: {kb:.1} KB)",
+            metrics.parquet_files_read,
+        );
+    } else {
+        println!("Time: {ms:.3} ms");
+    }
+}
+
 /// Executes all statements from a SQL file and prints each result.
-async fn execute_file_and_print(db: &mut PotatoDB, path: &str) {
+async fn execute_file_and_print(db: &mut PotatoDB, path: &str, timing: bool) {
     println!("Executing: {path}");
+    let file_start = Instant::now();
     match db.execute_file(path, true).await {
         Ok(results) => {
-            for (stmt, result) in results {
+            for (_stmt, result) in results {
                 match result {
                     Ok(QueryResult::Records(batches)) => {
                         println!("{}", display::format_batches_truncated(&batches));
                         println!("({} row(s))", display::row_count(&batches));
+                        println!();
                     }
                     Ok(QueryResult::Message(msg)) => {
                         println!("{msg}");
+                        println!();
                     }
                     Err(e) => {
-                        eprintln!("ERROR in statement:\n  {stmt}\n  {e}");
+                        eprintln!("ERROR: {e}");
+                        eprintln!();
                     }
                 }
+            }
+            if timing {
+                let total = file_start.elapsed();
+                println!(
+                    "Total file execution: {:.3} ms",
+                    total.as_secs_f64() * 1000.0
+                );
             }
             println!();
         }

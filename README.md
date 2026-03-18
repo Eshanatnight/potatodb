@@ -8,21 +8,17 @@ A Parquet-backed SQL database written in Rust, powered by [Apache DataFusion](ht
 ## Features
 
 - **Parquet-native SQL engine** -- DataFusion-powered query execution over Zstd-compressed Parquet with bloom/page pruning
-- **Local + S3 durability** -- local binary WAL and S3-backed WAL metadata replay for crash recovery
+- **Local + S3 durability** -- local binary WAL (buffered with fdatasync) and S3-backed WAL metadata replay for crash recovery
 - **Transactions with destructive rewrites** -- `UPDATE`, `DELETE`, `CREATE INDEX`, and `VACUUM` now work inside `BEGIN` / `COMMIT` / `ROLLBACK`
 - **Time travel queries** -- `AS OF TIMESTAMP` reads from captured snapshots
 - **Indexing options** -- multiple index metadata per table (primary + logical), plus `CREATE FULLTEXT INDEX` and `fts_match(...)`
 - **Rich types** -- `UUID`, `INTERVAL`, `ARRAY`, `JSON/JSONB`, decimals, timestamps, binary
-- **Programmability** -- lightweight `CREATE FUNCTION`, `CREATE PROCEDURE`, `CALL`, and `DO $$ ... $$`
+- **Programmability** -- lightweight `CREATE FUNCTION`, `CREATE PROCEDURE`, `CALL`, `DO $$ ... $$`, triggers, and `MERGE`
 - **Integrity features** -- `PRIMARY KEY`, `UNIQUE`, `CHECK`, and `FOREIGN KEY` with `RESTRICT` / `CASCADE` / `SET NULL`
-- **Operational tooling** -- CDC stream (`potatodb_cdc`), `LISTEN`/`NOTIFY`, auto-vacuum, retention policies, plan cache
-- **Multi-interface access** -- TUI, REPL, pgwire server (TLS-capable), C/C++ FFI, Python bindings, and HTTP API
- - **Operational tooling** -- CDC stream (`potatodb_cdc`), durable CDC persistence, `LISTEN`/`NOTIFY`, auto-vacuum, retention policies, plan cache, compaction/background maintenance
- - **Durability & storage** -- deletion vectors, partitioning for large tables, and S3-backed WAL replay for crash recovery
- - **Observability & telemetry** -- Prometheus metrics, per-query `QueryMetrics`, and `EXPLAIN ANALYZE` passthrough for end-to-end timings
- - **Programmability & SQL extensions** -- PL/pgSQL-style procedures, triggers, `MERGE`, and built-ins like `generate_series`
- - **Security & multi-tenancy** -- persisted RBAC (roles/grants persisted in the catalog) and connection pooling support
- - **Interfaces** -- WebSocket support and an experimental `crates/nodejs` integration crate; TUI includes additional meta-commands (`\dt`, `\di`, `\dv`, `\d`, `\ds`, `\df`, `\du`)
+- **Operational tooling** -- CDC stream (`potatodb_cdc`) with durable persistence, `LISTEN`/`NOTIFY`, auto-vacuum, compaction, retention policies, plan cache
+- **Observability** -- Prometheus metrics, per-query `QueryMetrics`, `\timing` command, and `EXPLAIN ANALYZE` passthrough
+- **Security & multi-tenancy** -- persisted RBAC (roles/grants in the catalog) and connection pooling support
+- **Multi-interface access** -- TUI, REPL, pgwire server (TLS-capable), C/C++ FFI, Python bindings, HTTP API, and WebSocket support
 
 ## Quick start
 
@@ -35,6 +31,12 @@ cargo run -- --repl
 
 # Custom data directory
 cargo run -- --data-dir /path/to/data
+
+# Execute SQL file(s) and exit
+cargo run -- -f setup.sql -f queries.sql
+
+# Execute SQL files with per-statement timing
+cargo run -- -f workload.sql --timing
 
 # Start HTTP API server
 cargo run -- --http-addr 127.0.0.1:8080
@@ -443,17 +445,19 @@ REVOKE SELECT ON orders FROM analyst;
 
 ### REPL special commands
 
-| Command      | Description             |
-| ------------ | ----------------------- |
-| `\q`         | Quit                    |
-| `\dt`        | List all tables         |
-| `\d <table>` | Describe table schema   |
-| `\di`        | List indexes            |
-| `\dv`        | List views              |
-| `\backup`    | Create local archive    |
-| `\restore`   | Restore local archive   |
-| `.import`    | Shorthand for COPY FROM |
-| `.export`    | Shorthand for COPY TO   |
+| Command             | Description                          |
+| ------------------- | ------------------------------------ |
+| `\q` / `quit` / `exit` | Quit                              |
+| `\dt`               | List all tables                      |
+| `\d <table>`        | Describe table schema                |
+| `\di`               | List indexes                         |
+| `\dv`               | List views                           |
+| `\timing`           | Toggle per-query timing display      |
+| `\i <file>` / `.source <file>` | Execute a SQL file          |
+| `\backup <path>`    | Create local archive                 |
+| `\restore <path>`   | Restore local archive                |
+| `.import`           | Shorthand for COPY FROM              |
+| `.export`           | Shorthand for COPY TO                |
 
 ## Architecture
 
@@ -473,7 +477,9 @@ potatodb/
     server/                   potatodb-server (pgwire)
     python/                   potatodb-python
     http/                     potatodb-http (REST API)
+    nodejs/                   potatodb-nodejs (Node.js integration)
     potatodb/                 potatodb (binary)
+  examples/                   perftest and other example binaries
 ```
 
 ### Crate dependency graph
@@ -531,6 +537,10 @@ The DataFusion session is configured with:
 - **Bloom filters** -- written on every INSERT, checked on equality predicates
 - **Zstd(3) compression** by default (configurable via `POTATODB_PARQUET_COMPRESSION`) with dictionary encoding -- smaller files, less I/O
 - **Parallel scans** across all CPU cores
+- **Deferred auto-analyze** -- `ANALYZE` runs between queries instead of blocking inserts
+- **Approximate distinct counts** -- `ANALYZE` uses HyperLogLog (`APPROX_DISTINCT`) instead of exact `COUNT(DISTINCT)`
+- **Buffered WAL writes** -- Arrow IPC WAL uses 256 KB buffered I/O with explicit `fdatasync`
+- **Tuned allocator** -- mimalloc with a 10-second purge delay to reduce `madvise` overhead
 
 The release profile enables full cross-crate LTO, single codegen unit, and `.cargo/config.toml` sets `target-cpu=native` for AVX2/AVX-512 SIMD vectorization in Arrow and Parquet codecs.
 
@@ -538,10 +548,10 @@ The release profile enables full cross-crate LTO, single codegen unit, and `.car
 
 Common environment variables:
 
-- `POTATODB_WAL_CHECKPOINT_BYTES` -- WAL checkpoint threshold for autocommit mode (default: 4 MiB)
+- `POTATODB_WAL_CHECKPOINT_BYTES` -- WAL checkpoint threshold for autocommit mode (default: 4 GiB)
 - `POTATODB_WRITE_BUFFER_ROWS` -- buffered insert row threshold (default: 10,000)
 - `POTATODB_WRITE_BUFFER_BYTES` -- buffered insert byte threshold (default: 64 MiB)
-- `POTATODB_WRITE_BUFFER_MS` -- buffered insert age threshold (default: 5000 ms)
+- `POTATODB_WRITE_BUFFER_MS` -- buffered insert age threshold (default: 360000 ms / 6 min)
 - `POTATODB_AUTO_ANALYZE_ROWS` -- rows written before automatic `ANALYZE` (default: 10,000)
 - `POTATODB_AUTO_VACUUM_INTERVAL_SECS` -- background compaction interval (0 disables)
 - `POTATODB_AUTO_VACUUM_FILE_THRESHOLD` -- file-count score component for compaction
@@ -552,6 +562,7 @@ Common environment variables:
 - `POTATODB_CDC_CAPACITY` -- max in-memory CDC event buffer length
 - `POTATODB_SNAPSHOT_RETENTION_MS` -- retention window for `AS OF TIMESTAMP` snapshots
 - `POTATODB_TLS_CERT` / `POTATODB_TLS_KEY` -- enable TLS in pgwire server
+- `MIMALLOC_PURGE_DELAY` -- seconds before mimalloc returns memory to the OS (default: 10, set automatically at startup)
 
 ## C / C++ FFI
 
@@ -774,9 +785,11 @@ cargo run -- --http-addr 127.0.0.1:8080
 Endpoints:
 
 - `GET /health`
+- `GET /metrics` (Prometheus metrics)
 - `GET /tables`
 - `GET /tables/{name}/stats`
 - `POST /query` with JSON body `{"sql":"SELECT ..."}`
+- `GET /ws` (WebSocket for streaming queries)
 
 ## Development
 
@@ -805,6 +818,27 @@ make clippy
 
 # Generate and open documentation
 make doc
+```
+
+### Performance testing
+
+An end-to-end performance test suite is available as an example binary.
+It runs a representative workload (bulk inserts, queries, joins,
+aggregations, window functions, DML, DDL, transactions) and produces
+a JSON report with timing statistics.
+
+```bash
+# Run performance test
+make perftest
+
+# Save a baseline for later comparison
+make perf-save
+
+# Run and compare against a saved baseline
+make perf-compare
+
+# Tune scale factor and iterations
+make perftest PERF_SCALE=2 PERF_ITERS=5
 ```
 
 See [DOCS.md](DOCS.md) for detailed technical documentation covering

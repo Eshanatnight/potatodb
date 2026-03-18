@@ -48,6 +48,8 @@ use arrow::{csv, json};
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::Column;
 use datafusion::common::{
     stats::Precision, ColumnStatistics as DfColumnStatistics, ScalarValue,
     Statistics as DfStatistics,
@@ -58,7 +60,10 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{
+    Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
+};
+use datafusion::optimizer::OptimizerRule;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -259,6 +264,96 @@ impl TableProvider for StatsAwareTableProvider {
     }
 }
 
+/// Splits Projection nodes that contain more than one scalar subquery into
+/// nested Projections with at most one each.  This prevents `DataFusion`'s
+/// `scalar_subquery_to_join` rule from producing duplicate `__always_true`
+/// columns that cause an "Ambiguous reference" error.
+#[derive(Debug)]
+struct SplitScalarSubqueries;
+
+impl OptimizerRule for SplitScalarSubqueries {
+    fn name(&self) -> &'static str {
+        "split_scalar_subqueries"
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn apply_order(&self) -> Option<datafusion::optimizer::optimizer::ApplyOrder> {
+        Some(datafusion::optimizer::optimizer::ApplyOrder::TopDown)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn datafusion::optimizer::OptimizerConfig,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Projection(ref proj) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let sq_indices: Vec<usize> = proj
+            .expr
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.exists(|inner| Ok(matches!(inner, Expr::ScalarSubquery(_))))
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if sq_indices.len() <= 1 {
+            return Ok(Transformed::no(plan));
+        }
+
+        let input = proj.input.as_ref().clone();
+        let first_sq_idx = sq_indices[0];
+        let first_sq_expr = proj.expr[first_sq_idx].clone();
+
+        let sq_alias = format!("__potato_sq_{first_sq_idx}");
+
+        let (base_expr, orig_alias) = match first_sq_expr {
+            Expr::Alias(ref a) => (a.expr.as_ref().clone(), Some(a.name.clone())),
+            _ => (first_sq_expr, None),
+        };
+
+        let mut inner_exprs: Vec<Expr> = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::from)
+            .collect();
+        inner_exprs.push(base_expr.alias(&sq_alias));
+
+        let inner_plan = LogicalPlanBuilder::from(input)
+            .project(inner_exprs)?
+            .build()?;
+
+        let col_ref = Expr::Column(Column::new_unqualified(&sq_alias));
+        let outer_ref = match orig_alias {
+            Some(name) => col_ref.alias(name),
+            None => col_ref,
+        };
+
+        let mut outer_exprs = Vec::with_capacity(proj.expr.len());
+        for (i, expr) in proj.expr.iter().enumerate() {
+            if i == first_sq_idx {
+                outer_exprs.push(outer_ref.clone());
+            } else {
+                outer_exprs.push(expr.clone());
+            }
+        }
+
+        let new_plan = LogicalPlanBuilder::from(inner_plan)
+            .project(outer_exprs)?
+            .build()?;
+
+        Ok(Transformed::yes(new_plan))
+    }
+}
+
 /// State for an in-flight explicit transaction started with `BEGIN`.
 struct Transaction {
     /// Catalog state captured at `BEGIN` for rollback.
@@ -343,6 +438,10 @@ pub struct PotatoDB {
     rows_since_analyze: HashMap<String, usize>,
     /// Threshold that triggers automatic ANALYZE.
     auto_analyze_threshold_rows: usize,
+    /// Tables that have hit the auto-analyze threshold but haven't been
+    /// analyzed yet.  Drained lazily at the start of the next `execute`
+    /// call so that INSERT / COPY / UPSERT callers are not blocked.
+    pending_analyze_tables: Vec<String>,
     /// Logical-plan cache for repeated read-only SQL text.
     plan_cache: HashMap<String, LogicalPlan>,
     /// Number of times a cached plan was reused (plan cache hits).
@@ -422,8 +521,8 @@ fn parse_parquet_compression(s: &str) -> parquet::basic::Compression {
 /// Builds a [`SessionConfig`] tuned for Parquet performance.
 ///
 /// Key settings can be overridden via environment variables:
-/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 8192)
-/// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 8192)
+/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 32768)
+/// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 16384)
 /// - `POTATODB_TARGET_PARTITIONS` — Number of parallel partitions (default: CPU cores)
 /// - `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` — Enforce batch size in hash joins (default: true)
 /// - `POTATODB_COALESCE_BATCHES` — Coalesce small batches between operators (default: true)
@@ -440,7 +539,7 @@ fn build_session_config() -> SessionConfig {
     let batch_size = std::env::var("POTATODB_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16384);
+        .unwrap_or(32768);
 
     let write_batch_size = std::env::var("POTATODB_PARQUET_WRITE_BATCH_SIZE")
         .ok()
@@ -471,6 +570,8 @@ fn build_session_config() -> SessionConfig {
         .with_target_partitions(parallelism)
         .with_enforce_batch_size_in_joins(enforce_batch_size_in_joins)
         .with_coalesce_batches(coalesce_batches);
+
+    config.options_mut().optimizer.skip_failed_rules = true;
 
     let parquet = &mut config.options_mut().execution.parquet;
 
@@ -507,6 +608,7 @@ impl PotatoDB {
     pub async fn new(data_url: String, s3_config: Option<S3Config>) -> Result<Self, BoxError> {
         let config = build_session_config();
         let ctx = SessionContext::new_with_config(config);
+        ctx.add_optimizer_rule(Arc::new(SplitScalarSubqueries));
 
         // Ensure generate_series table function is available (PostgreSQL-compatible)
         let gs = datafusion::functions_table::generate_series();
@@ -688,6 +790,7 @@ impl PotatoDB {
             temp_table_counter: 0,
             rows_since_analyze: HashMap::new(),
             auto_analyze_threshold_rows,
+            pending_analyze_tables: Vec::new(),
             plan_cache: HashMap::new(),
             plan_cache_hits: 0,
             procedures: HashMap::new(),
@@ -1136,11 +1239,11 @@ impl PotatoDB {
         let _ = self.ctx.deregister_table(&tmp_name);
         write_result?;
 
-        if let Some(ref awal) = self.arrow_wal {
+        if let Some(ref mut awal) = self.arrow_wal {
             awal.checkpoint_table(table_name)?;
         }
 
-        self.maybe_auto_analyze(table_name, row_count).await?;
+        self.maybe_auto_analyze(table_name, row_count);
         self.refresh_table_file_stats_light(table_name).await?;
         self.maybe_auto_compact(table_name).await?;
 
@@ -1220,13 +1323,9 @@ impl PotatoDB {
         Ok(total)
     }
 
-    async fn maybe_auto_analyze(
-        &mut self,
-        table_name: &str,
-        rows_written: usize,
-    ) -> Result<(), BoxError> {
+    fn maybe_auto_analyze(&mut self, table_name: &str, rows_written: usize) {
         if rows_written == 0 || self.auto_analyze_threshold_rows == 0 {
-            return Ok(());
+            return;
         }
         let entry = self
             .rows_since_analyze
@@ -1235,9 +1334,18 @@ impl PotatoDB {
         *entry = entry.saturating_add(rows_written);
         if *entry >= self.auto_analyze_threshold_rows {
             *entry = 0;
-            let _ = self.handle_analyze(table_name).await?;
+            self.pending_analyze_tables.push(table_name.to_string());
         }
-        Ok(())
+    }
+
+    async fn drain_pending_analyze(&mut self) {
+        if self.pending_analyze_tables.is_empty() {
+            return;
+        }
+        let tables = std::mem::take(&mut self.pending_analyze_tables);
+        for table in tables {
+            let _ = self.handle_analyze(&table).await;
+        }
     }
 
     async fn expand_nextval_calls(&mut self, sql: &str) -> Result<String, BoxError> {
@@ -1527,8 +1635,12 @@ impl PotatoDB {
         Ok(())
     }
 
-    /// Reads all data from a table, deletes its Parquet files,
-    /// re-registers it, and writes the given batches back.
+    /// Replaces a table's Parquet files with the given `batches`.
+    ///
+    /// Before touching any files, a full in-memory snapshot of the current
+    /// table data is captured.  If the write of new data fails (e.g. disk
+    /// full, schema mismatch), the snapshot is written back so no data is
+    /// lost.
     ///
     /// This is the core "copy-on-write rewrite" used by `DELETE`,
     /// `UPDATE`, `VACUUM`, and `CREATE INDEX`.
@@ -1544,6 +1656,18 @@ impl PotatoDB {
             .get(table_name)
             .ok_or_else(|| format!("Table '{table_name}' does not exist"))?
             .clone();
+
+        let original_batches: Vec<RecordBatch> = self
+            .ctx
+            .sql(&format!("SELECT * FROM \"{table_name}\""))
+            .await?
+            .collect()
+            .await?;
+        let original_schema = if original_batches.is_empty() {
+            None
+        } else {
+            Some(original_batches[0].schema())
+        };
 
         self.ctx.deregister_table(table_name)?;
         self.delete_parquet_files(table_name).await?;
@@ -1562,22 +1686,77 @@ impl PotatoDB {
 
         let has_data = !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0);
         if has_data {
-            let mem = MemTable::try_new(schema, vec![batches])?;
-            self.ctx
-                .register_table("__potato_rewrite_tmp", Arc::new(mem))?;
-            self.ctx
-                .sql(&format!(
-                    "INSERT INTO \"{table_name}\" SELECT * FROM __potato_rewrite_tmp"
-                ))
-                .await?
-                .collect()
-                .await?;
-            self.ctx.deregister_table("__potato_rewrite_tmp")?;
+            let prep = MemTable::try_new(schema, vec![batches]).and_then(|mem| {
+                self.ctx
+                    .register_table("__potato_rewrite_tmp", Arc::new(mem))?;
+                Ok(())
+            });
+
+            let write_result: Result<(), BoxError> = if let Err(e) = prep {
+                Err(e.into())
+            } else {
+                let r = match self
+                    .ctx
+                    .sql(&format!(
+                        "INSERT INTO \"{table_name}\" SELECT * FROM __potato_rewrite_tmp"
+                    ))
+                    .await
+                {
+                    Ok(df) => df.collect().await,
+                    Err(e) => Err(e),
+                };
+                let _ = self.ctx.deregister_table("__potato_rewrite_tmp");
+                r.map(|_| ()).map_err(Into::into)
+            };
+
+            if let Err(e) = write_result {
+                self.restore_table_from_snapshot(table_name, original_schema, original_batches)
+                    .await;
+                return Err(e);
+            }
         }
 
         self.refresh_table_file_stats_light(table_name).await?;
 
         Ok(())
+    }
+
+    /// Best-effort restore of table data from an in-memory snapshot.
+    async fn restore_table_from_snapshot(
+        &self,
+        table_name: &str,
+        original_schema: Option<SchemaRef>,
+        original_batches: Vec<RecordBatch>,
+    ) {
+        let Some(schema) = original_schema else {
+            return;
+        };
+        let has_orig =
+            !original_batches.is_empty() && original_batches.iter().any(|b| b.num_rows() > 0);
+        if !has_orig {
+            return;
+        }
+        let Ok(mem) = MemTable::try_new(schema, vec![original_batches]) else {
+            return;
+        };
+        if self
+            .ctx
+            .register_table("__potato_restore_tmp", Arc::new(mem))
+            .is_err()
+        {
+            return;
+        }
+        let _ = async {
+            self.ctx
+                .sql(&format!(
+                    "INSERT INTO \"{table_name}\" SELECT * FROM __potato_restore_tmp"
+                ))
+                .await?
+                .collect()
+                .await
+        }
+        .await;
+        let _ = self.ctx.deregister_table("__potato_restore_tmp");
     }
 
     /// Captures a full-table backup before a destructive rewrite in a txn.
@@ -1885,6 +2064,7 @@ impl PotatoDB {
     /// Returns an error if the SQL is invalid or execution fails.
     #[async_recursion::async_recursion]
     pub async fn execute(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        self.drain_pending_analyze().await;
         self.last_query_metrics = QueryMetrics::default();
         let started_at = Instant::now();
         let mut effective_sql = self.expand_nextval_calls(sql).await?;
@@ -2558,7 +2738,6 @@ impl PotatoDB {
 
     async fn collect_with_plan_cache(&mut self, sql: &str) -> Result<Vec<RecordBatch>, BoxError> {
         if is_read_only_sql(sql) {
-            // Partition awareness: log when query touches partitioned tables
             for table_name in extract_table_names_from_readonly_sql(sql) {
                 if let Some(meta) = self.catalog.tables.get(&table_name) {
                     if !meta.partition_columns.is_empty() {
@@ -2580,14 +2759,37 @@ impl PotatoDB {
                 }
                 self.plan_cache.remove(sql);
             }
-            let df = self.ctx.sql(sql).await?;
-            let plan = df.logical_plan().clone();
-            let batches = df.collect().await?;
-            self.plan_cache.insert(sql.to_string(), plan);
-            return Ok(batches);
+            match self.ctx.sql(sql).await {
+                Ok(df) => {
+                    let plan = df.logical_plan().clone();
+                    let batches = df.collect().await?;
+                    self.plan_cache.insert(sql.to_string(), plan);
+                    return Ok(batches);
+                }
+                Err(e) if e.to_string().contains("coerce types Duration") => {
+                    if let Some(rewritten) = rewrite_date_subtraction_sql(sql) {
+                        let df = self.ctx.sql(&rewritten).await?;
+                        let plan = df.logical_plan().clone();
+                        let batches = df.collect().await?;
+                        self.plan_cache.insert(sql.to_string(), plan);
+                        return Ok(batches);
+                    }
+                    return Err(e.into());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        let df = self.ctx.sql(sql).await?;
-        Ok(df.collect().await?)
+        match self.ctx.sql(sql).await {
+            Ok(df) => Ok(df.collect().await?),
+            Err(e) if e.to_string().contains("coerce types Duration") => {
+                if let Some(rewritten) = rewrite_date_subtraction_sql(sql) {
+                    let df = self.ctx.sql(&rewritten).await?;
+                    return Ok(df.collect().await?);
+                }
+                Err(e.into())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn capture_snapshot(&mut self) -> Result<(), BoxError> {
@@ -4130,8 +4332,13 @@ impl PotatoDB {
         };
 
         let df = self.ctx.sql(&select_sql).await?;
-        let schema = Arc::new(df.schema().as_arrow().clone());
+        let logical_schema = Arc::new(df.schema().as_arrow().clone());
         let surviving = df.collect().await?;
+        let schema = if surviving.is_empty() {
+            logical_schema
+        } else {
+            surviving[0].schema()
+        };
         let new_count: usize = surviving
             .iter()
             .map(arrow::array::RecordBatch::num_rows)
@@ -4228,8 +4435,9 @@ impl PotatoDB {
                     t.trim_matches('"') == target_name
                 }) {
                     format!(
-                        "CASE WHEN ({where_expr}) THEN ({val}) ELSE \"{col}\" END AS \"{col}\"",
+                        "CASE WHEN ({where_expr}) THEN CAST(({val}) AS {ty}) ELSE \"{col}\" END AS \"{col}\"",
                         val = assignment.value,
+                        ty = c.data_type,
                         col = target_name
                     )
                 } else {
@@ -4241,8 +4449,13 @@ impl PotatoDB {
         let rewrite_sql = format!("SELECT {} FROM \"{table_name}\"", projections.join(", "));
 
         let df = self.ctx.sql(&rewrite_sql).await?;
-        let schema = Arc::new(df.schema().as_arrow().clone());
+        let logical_schema = Arc::new(df.schema().as_arrow().clone());
         let modified = df.collect().await?;
+        let schema = if modified.is_empty() {
+            logical_schema
+        } else {
+            modified[0].schema()
+        };
 
         self.rewrite_table(&table_name, schema, modified).await?;
         if let Some(meta) = self.catalog.tables.get_mut(&table_name) {
@@ -4263,7 +4476,10 @@ impl PotatoDB {
     }
 
     /// Handles `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...`.
-    /// Delegates to UPDATE and INSERT by building equivalent SQL and calling `execute()`.
+    ///
+    /// Materialises the USING source into a temporary `__merge_src` table,
+    /// then directly computes the merged result using `ctx.sql()` + LEFT JOIN
+    /// (bypassing `execute()` so the temp table stays visible to `DataFusion`).
     async fn handle_merge(
         &mut self,
         table: &TableFactor,
@@ -4271,115 +4487,247 @@ impl PotatoDB {
         on: &sqlparser::ast::Expr,
         clauses: &[sqlparser::ast::MergeClause],
     ) -> Result<QueryResult, BoxError> {
-        let target_str = table.to_string();
-        let source_str = source.to_string();
-        let on_str = on.to_string();
+        let (target_name, target_alias) = match table {
+            TableFactor::Table { name, alias, .. } => {
+                let n = name.to_string().trim_matches('"').to_string();
+                let a = alias.as_ref().map(|a| a.name.value.clone());
+                (n, a)
+            }
+            _ => return Err("MERGE target must be a table".into()),
+        };
 
-        if !matches!(table, TableFactor::Table { .. }) {
-            return Err("MERGE target must be a table".into());
+        let table_meta = self
+            .catalog
+            .tables
+            .get(&target_name)
+            .ok_or_else(|| format!("Table '{target_name}' does not exist"))?
+            .clone();
+
+        let _ = self.flush_all().await?;
+
+        let (source_sql, source_alias, source_table_name) = match source {
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => (
+                subquery.to_string(),
+                alias.as_ref().map(|a| a.name.value.clone()),
+                None,
+            ),
+            TableFactor::Table { name, alias, .. } => {
+                let sn = name.to_string().trim_matches('"').to_string();
+                (
+                    format!("SELECT * FROM {name}"),
+                    alias.as_ref().map(|a| a.name.value.clone()),
+                    Some(sn),
+                )
+            }
+            _ => return Err("Unsupported MERGE source type".into()),
+        };
+
+        let rewrite = |s: &str| -> String {
+            let mut r = s.to_string();
+            if let Some(ref a) = target_alias {
+                r = r.replace(&format!("{a}."), &format!("\"{target_name}\"."));
+            }
+            if let Some(ref a) = source_alias {
+                r = r.replace(&format!("{a}."), "\"__merge_src\".");
+            } else if let Some(ref sn) = source_table_name {
+                r = r.replace(&format!("{sn}."), "\"__merge_src\".");
+            }
+            r
+        };
+
+        let src_df = self.ctx.sql(&source_sql).await?;
+        let src_batches = src_df.collect().await?;
+        if src_batches.is_empty() || src_batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(QueryResult::Message(
+                "0 row(s) updated, 0 row(s) inserted.".into(),
+            ));
         }
+        let src_schema = src_batches[0].schema();
+        let mem_table = MemTable::try_new(src_schema, vec![src_batches])?;
+        self.ctx
+            .register_table("__merge_src", Arc::new(mem_table))?;
+
+        let on_str = rewrite(&on.to_string());
 
         let mut total_updated = 0_i64;
         let mut total_inserted = 0_i64;
 
-        for clause in clauses {
-            let predicate_str = clause
-                .predicate
-                .as_ref()
-                .map(|p| format!(" AND ({p})"))
-                .unwrap_or_default();
+        let inner: Result<(), BoxError> = async {
+            for clause in clauses {
+                let predicate_str = clause
+                    .predicate
+                    .as_ref()
+                    .map(|p| format!(" AND ({})", rewrite(&p.to_string())))
+                    .unwrap_or_default();
 
-            match (&clause.clause_kind, &clause.action) {
-                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                    let set_parts: Vec<String> = assignments
-                        .iter()
-                        .map(|a| format!("{} = {}", a.target, a.value))
-                        .collect();
-                    let set_clause = set_parts.join(", ");
-                    let update_sql = format!(
-                        "UPDATE {target_str} SET {set_clause} FROM {source_str} WHERE ({on_str}){predicate_str}",
-                    );
-                    let result = self.execute(&update_sql).await?;
-                    if let QueryResult::Message(msg) = result {
-                        if let Some(n) = msg
-                            .split_whitespace()
-                            .next()
-                            .and_then(|s| s.parse::<i64>().ok())
-                        {
-                            total_updated += n;
+                match (&clause.clause_kind, &clause.action) {
+                    (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
+                        let mut update_map: HashMap<String, String> = HashMap::new();
+                        for a in assignments {
+                            let col = a.target.to_string().trim_matches('"').to_string();
+                            let val = rewrite(&a.value.to_string());
+                            update_map.insert(col, val);
                         }
-                    }
-                }
-                (MergeClauseKind::Matched, MergeAction::Delete) => {
-                    let delete_sql = format!(
-                        "DELETE FROM {target_str} WHERE EXISTS (SELECT 1 FROM {source_str} WHERE ({on_str})){predicate_str}",
-                    );
-                    let _ = self.execute(&delete_sql).await?;
-                }
-                (
-                    MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
-                    MergeAction::Insert(insert_expr),
-                ) => {
-                    let (cols, select_list) = match &insert_expr.kind {
-                        MergeInsertKind::Row => {
-                            let cols = if insert_expr.columns.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    " ({})",
-                                    insert_expr
-                                        .columns
-                                        .iter()
-                                        .map(std::string::ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )
-                            };
-                            (cols, "*".to_string())
-                        }
-                        MergeInsertKind::Values(values) => {
-                            let cols = if insert_expr.columns.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    " ({})",
-                                    insert_expr
-                                        .columns
-                                        .iter()
-                                        .map(std::string::ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )
-                            };
-                            let select_list = values.rows.first().map_or_else(
-                                || "*".to_string(),
-                                |row| {
-                                    row.iter()
-                                        .map(std::string::ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                },
+
+                        let projections: Vec<String> = table_meta
+                            .columns
+                            .iter()
+                            .map(|c| {
+                                if let Some(val) = update_map.get(&c.name) {
+                                    format!(
+                                        "CASE WHEN \"__merge_src_match\" IS NOT NULL \
+                                         THEN CAST({val} AS {}) \
+                                         ELSE \"{target_name}\".\"{col}\" \
+                                         END AS \"{col}\"",
+                                        c.data_type,
+                                        col = c.name
+                                    )
+                                } else {
+                                    format!("\"{target_name}\".\"{}\"", c.name)
+                                }
+                            })
+                            .collect();
+
+                        let count_sql = format!(
+                            "SELECT COUNT(*) AS c \
+                             FROM \"{target_name}\" \
+                             INNER JOIN \"__merge_src\" ON ({on_str}){predicate_str}"
+                        );
+                        let count_batches = self.ctx.sql(&count_sql).await?.collect().await?;
+                        total_updated = count_batches
+                            .iter()
+                            .find_map(|b| {
+                                b.column(0)
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .map(|a| a.value(0))
+                            })
+                            .unwrap_or(0);
+
+                        if total_updated > 0 {
+                            let rewrite_sql = format!(
+                                "SELECT {proj} \
+                                 FROM \"{target_name}\" \
+                                 LEFT JOIN (\
+                                     SELECT *, TRUE AS \"__merge_src_match\" \
+                                     FROM \"__merge_src\"\
+                                 ) AS \"__merge_src\" ON ({on_str}){predicate_str}",
+                                proj = projections.join(", ")
                             );
-                            (cols, select_list)
-                        }
-                    };
-                    let insert_sql = format!(
-                        "INSERT INTO {target_str}{cols} SELECT {select_list} FROM {source_str} WHERE NOT EXISTS (SELECT 1 FROM {target_str} WHERE {on_str}){predicate_str}"
-                    );
-                    let result = self.execute(&insert_sql).await?;
-                    if let QueryResult::Message(msg) = result {
-                        if let Some(n) = msg
-                            .split_whitespace()
-                            .next()
-                            .and_then(|s| s.parse::<i64>().ok())
-                        {
-                            total_inserted += n;
+                            let df = self.ctx.sql(&rewrite_sql).await?;
+                            let logical_schema = Arc::new(df.schema().as_arrow().clone());
+                            let batches = df.collect().await?;
+                            let schema = if batches.is_empty() {
+                                logical_schema
+                            } else {
+                                batches[0].schema()
+                            };
+                            self.rewrite_table(&target_name, schema, batches).await?;
                         }
                     }
+                    (MergeClauseKind::Matched, MergeAction::Delete) => {
+                        let keep_sql = format!(
+                            "SELECT \"{target_name}\".* \
+                             FROM \"{target_name}\" \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM \"__merge_src\" \
+                                 WHERE ({on_str}){predicate_str}\
+                             )"
+                        );
+                        let df = self.ctx.sql(&keep_sql).await?;
+                        let logical_schema = Arc::new(df.schema().as_arrow().clone());
+                        let batches = df.collect().await?;
+                        let schema = if batches.is_empty() {
+                            logical_schema
+                        } else {
+                            batches[0].schema()
+                        };
+                        self.rewrite_table(&target_name, schema, batches).await?;
+                    }
+                    (
+                        MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
+                        MergeAction::Insert(insert_expr),
+                    ) => {
+                        let (cols, select_list) = match &insert_expr.kind {
+                            MergeInsertKind::Row => {
+                                let cols = if insert_expr.columns.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " ({})",
+                                        insert_expr
+                                            .columns
+                                            .iter()
+                                            .map(std::string::ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                };
+                                (cols, "*".to_string())
+                            }
+                            MergeInsertKind::Values(values) => {
+                                let cols = if insert_expr.columns.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " ({})",
+                                        insert_expr
+                                            .columns
+                                            .iter()
+                                            .map(std::string::ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                };
+                                let select_list = values.rows.first().map_or_else(
+                                    || "*".to_string(),
+                                    |row| {
+                                        row.iter()
+                                            .map(|v| rewrite(&v.to_string()))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    },
+                                );
+                                (cols, select_list)
+                            }
+                        };
+                        let insert_sql = format!(
+                            "INSERT INTO \"{target_name}\"{cols} \
+                             SELECT {select_list} FROM \"__merge_src\" \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM \"{target_name}\" \
+                                 WHERE ({on_str})\
+                             ){predicate_str}"
+                        );
+                        let insert_batches = self.ctx.sql(&insert_sql).await?.collect().await?;
+                        total_inserted = insert_batches
+                            .iter()
+                            .find_map(|b| {
+                                b.column(0)
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::UInt64Array>()
+                                    .map(|a| a.value(0).cast_signed())
+                            })
+                            .unwrap_or(0);
+                        self.refresh_table_file_stats_light(&target_name).await?;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            Ok(())
         }
+        .await;
+
+        let _ = self.ctx.deregister_table("__merge_src");
+        inner?;
+
+        self.record_cdc_event(
+            &target_name,
+            "MERGE",
+            (total_updated + total_inserted) as usize,
+        );
 
         Ok(QueryResult::Message(format!(
             "{total_updated} row(s) updated, {total_inserted} row(s) inserted."
@@ -4801,7 +5149,7 @@ impl PotatoDB {
 
             self.validate_constraints_batch(&table_name, &target_columns, &batches)
                 .await?;
-            self.maybe_auto_analyze(&table_name, inserted_rows).await?;
+            self.maybe_auto_analyze(&table_name, inserted_rows);
             self.refresh_table_file_stats_light(&table_name).await?;
             self.record_cdc_event(&table_name, "INSERT", inserted_rows);
 
@@ -5102,8 +5450,7 @@ impl PotatoDB {
         self.validate_not_null_table(&table_name).await?;
         self.validate_table_constraints(&table_name).await?;
         self.validate_check_constraints(&table_name).await?;
-        self.maybe_auto_analyze(&table_name, inserted.saturating_add(updated))
-            .await?;
+        self.maybe_auto_analyze(&table_name, inserted.saturating_add(updated));
         self.refresh_table_file_stats_light(&table_name).await?;
         self.record_cdc_event(&table_name, "UPSERT", inserted.saturating_add(updated));
 
@@ -5191,14 +5538,14 @@ impl PotatoDB {
             .flatten()
             .sum();
 
-        let mut col_stats = HashMap::new();
+        let mut col_stats = HashMap::with_capacity(table_meta.columns.len());
 
         for col_def in &table_meta.columns {
             let col_name = &col_def.name;
             let stats_sql = format!(
                 "SELECT \
                      COUNT(*) - COUNT(\"{col_name}\") AS null_count, \
-                     COUNT(DISTINCT \"{col_name}\") AS distinct_count, \
+                     APPROX_DISTINCT(\"{col_name}\") AS distinct_count, \
                      CAST(MIN(\"{col_name}\") AS VARCHAR) AS min_val, \
                      CAST(MAX(\"{col_name}\") AS VARCHAR) AS max_val \
                  FROM \"{table_name}\""
@@ -5215,8 +5562,8 @@ impl PotatoDB {
                 let distinct_count = batch
                     .column(1)
                     .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .map(|a| a.value(0) as u64);
+                    .downcast_ref::<UInt64Array>()
+                    .map(|a| a.value(0));
                 let min_value = batch
                     .column(2)
                     .as_any()
@@ -5414,7 +5761,7 @@ impl PotatoDB {
         self.validate_not_null_table(table_name).await?;
         self.validate_table_constraints(table_name).await?;
         self.validate_check_constraints(table_name).await?;
-        self.maybe_auto_analyze(table_name, total_rows).await?;
+        self.maybe_auto_analyze(table_name, total_rows);
         self.refresh_table_file_stats(table_name).await?;
         self.record_cdc_event(table_name, "COPY_FROM", total_rows);
 
@@ -6086,7 +6433,10 @@ fn extract_mutated_table(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::Insert(ins) => Some(ins.table.to_string()),
         Statement::Update { table, .. } => Some(table.relation.to_string()),
-        Statement::Merge { table, .. } => Some(table.to_string()),
+        Statement::Merge { table, .. } => match table {
+            TableFactor::Table { name, .. } => Some(name.to_string().trim_matches('"').to_string()),
+            _ => Some(table.to_string()),
+        },
         Statement::Delete(del) => match &del.from {
             sqlparser::ast::FromTable::WithFromKeyword(tables)
             | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
@@ -6551,6 +6901,166 @@ fn extract_dollar_quoted_body(sql: &str) -> Option<String> {
     let tail = &sql[start + 2..];
     let end = tail.find("$$")?;
     Some(tail[..end].to_string())
+}
+
+/// Rewrites subtraction expressions in SELECT items so that Date−Date
+/// arithmetic produces an integer (days) instead of a Duration.
+///
+/// Called as a fallback when `DataFusion`'s type-coercion rejects
+/// `Duration BETWEEN Int`.  Each `a - b` in a SELECT-item position is
+/// replaced with `CAST(date_part('epoch', (a - b)) / 86400 AS BIGINT)`.
+/// If the subtraction was numeric the retry will fail harmlessly and the
+/// original error is returned to the caller.
+fn rewrite_date_subtraction_sql(sql: &str) -> Option<String> {
+    use sqlparser::ast::{
+        BinaryOperator, CastKind, DataType as SqlDT, Expr as SqlE, FunctionArg, FunctionArgExpr,
+        FunctionArguments, ObjectNamePart, Query, SelectItem, SetExpr,
+    };
+
+    fn rewrite_expr(e: &mut SqlE) {
+        match e {
+            SqlE::BinaryOp {
+                op: BinaryOperator::Minus,
+                ..
+            } => {
+                let original = e.clone();
+                let epoch_lit =
+                    SqlE::Value(sqlparser::ast::Value::SingleQuotedString("epoch".into()).into());
+                let date_part_fn = SqlE::Function(sqlparser::ast::Function {
+                    name: sqlparser::ast::ObjectName(vec![ObjectNamePart::Identifier(
+                        sqlparser::ast::Ident::new("date_part"),
+                    )]),
+                    uses_odbc_syntax: false,
+                    parameters: FunctionArguments::None,
+                    args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args: vec![
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(epoch_lit)),
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlE::Nested(Box::new(
+                                original,
+                            )))),
+                        ],
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: vec![],
+                });
+                let divided = SqlE::BinaryOp {
+                    left: Box::new(date_part_fn),
+                    op: BinaryOperator::Divide,
+                    right: Box::new(SqlE::Value(
+                        sqlparser::ast::Value::Number("86400".into(), false).into(),
+                    )),
+                };
+                *e = SqlE::Cast {
+                    expr: Box::new(SqlE::Nested(Box::new(divided))),
+                    data_type: SqlDT::BigInt(None),
+                    format: None,
+                    kind: CastKind::Cast,
+                };
+            }
+            _ => {
+                visit_expr_children_mut(e, rewrite_expr);
+            }
+        }
+    }
+
+    fn visit_expr_children_mut(e: &mut SqlE, f: fn(&mut SqlE)) {
+        match e {
+            SqlE::Nested(inner) | SqlE::UnaryOp { expr: inner, .. } => f(inner),
+            SqlE::BinaryOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            SqlE::Cast { expr, .. } => f(expr),
+            SqlE::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(o) = operand {
+                    f(o);
+                }
+                for cw in conditions {
+                    f(&mut cw.condition);
+                    f(&mut cw.result);
+                }
+                if let Some(el) = else_result {
+                    f(el);
+                }
+            }
+            SqlE::Between {
+                expr, low, high, ..
+            } => {
+                f(expr);
+                f(low);
+                f(high);
+            }
+            SqlE::Function(func) => {
+                if let FunctionArguments::List(ref mut list) = func.args {
+                    for arg in &mut list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(ex))
+                            | FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(ex),
+                                ..
+                            } => f(ex),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            SqlE::Subquery(q) => rewrite_query(q),
+            _ => {}
+        }
+    }
+
+    fn rewrite_select_items(items: &mut [SelectItem]) {
+        for item in items {
+            match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    rewrite_expr(e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite_set_expr(se: &mut SetExpr) {
+        match se {
+            SetExpr::Select(sel) => rewrite_select_items(&mut sel.projection),
+            SetExpr::Query(q) => rewrite_query(q),
+            SetExpr::SetOperation { left, right, .. } => {
+                rewrite_set_expr(left);
+                rewrite_set_expr(right);
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_query(q: &mut Query) {
+        for cte in q.with.iter_mut().flat_map(|w| w.cte_tables.iter_mut()) {
+            rewrite_query(&mut cte.query);
+        }
+        rewrite_set_expr(&mut q.body);
+    }
+
+    let dialect = PostgreSqlDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    let stmt = stmts.first_mut()?;
+    match stmt {
+        Statement::Query(q) => rewrite_query(q),
+        Statement::Explain { statement, .. } => {
+            if let Statement::Query(q) = statement.as_mut() {
+                rewrite_query(q);
+            }
+        }
+        _ => return None,
+    }
+    Some(stmts[0].to_string())
 }
 
 fn rewrite_fulltext_match_sql(sql: &str, fulltext: &HashMap<String, FulltextIndexDef>) -> String {

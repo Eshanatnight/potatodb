@@ -1,12 +1,15 @@
+use std::sync::Arc;
+use std::time::Instant;
+
 use clap::Parser;
 use mimalloc::MiMalloc;
 use potatodb_engine::{QueryResult, S3Config};
+use tokio::sync::RwLock;
+
+use potatodb_tui::ThemeChoice;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-use potatodb_tui::ThemeChoice;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Parser)]
 #[command(name = "potatodb", about = "A Parquet-backed SQL database")]
@@ -43,6 +46,10 @@ struct Cli {
     #[arg(short = 'f', long = "file")]
     files: Vec<String>,
 
+    /// Print per-statement execution time when running SQL files.
+    #[arg(long)]
+    timing: bool,
+
     /// Start HTTP API server on this address (e.g. 127.0.0.1:8080).
     #[arg(long)]
     http_addr: Option<String>,
@@ -50,6 +57,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        std::env::set_var("MIMALLOC_PURGE_DELAY", "10");
+    }
+
     let cli = Cli::parse();
 
     let data_dir = cli.data_dir.clone();
@@ -69,25 +80,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if !cli.files.is_empty() {
         let mut had_error = false;
+        let show_timing = cli.timing;
         for path in &cli.files {
             println!("Executing: {path}");
+            let file_start = Instant::now();
             match db.execute_file(path, false).await {
                 Ok(results) => {
-                    for (stmt, result) in results {
+                    for (_stmt, result) in results {
                         match result {
                             Ok(QueryResult::Records(batches)) => {
-                                let rows = potatodb_display::row_count(&batches);
-                                println!("{}", potatodb_display::format_batches(&batches));
-                                println!("({rows} row(s))\n");
+                                println!(
+                                    "{}",
+                                    potatodb_display::format_batches_truncated(&batches)
+                                );
+                                println!("({} row(s))", potatodb_display::row_count(&batches));
+                                println!();
                             }
                             Ok(QueryResult::Message(msg)) => {
                                 println!("{msg}");
+                                println!();
                             }
                             Err(e) => {
-                                eprintln!("ERROR in statement:\n  {stmt}\n  {e}\n");
+                                eprintln!("ERROR: {e}");
+                                eprintln!();
                                 had_error = true;
                             }
                         }
+                    }
+                    if show_timing {
+                        let total = file_start.elapsed();
+                        println!(
+                            "Total file execution: {:.3} ms",
+                            total.as_secs_f64() * 1000.0
+                        );
                     }
                 }
                 Err(e) => {
