@@ -21,7 +21,7 @@
 //! - `sql` -- the UTF-8 SQL statement.
 
 pub mod arrow_wal;
-pub use arrow_wal::ArrowWal;
+pub use arrow_wal::{ArrowWal, ArrowWalConfig, ArrowWalSyncPolicy};
 
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
