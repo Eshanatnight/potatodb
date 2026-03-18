@@ -1,4 +1,4 @@
-.PHONY: all help build check clippy clippy-fix fmt fmt-check clean test \
+.PHONY: all help build check clippy-full clippy-base clippy clippy-fix fmt fmt-check clean test \
        rust-test bench bench-html release run run-repl run-release doc ffi ffi-example ffi-test \
        python-test package perftest perf-save perf-compare
 
@@ -64,10 +64,15 @@ check:
 
 # ── Quality ──────────────────────────────────────────────────
 
-clippy:
+clippy-base:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+clippy-full:
 	cargo clippy --workspace -- -W clippy::pedantic -W clippy::nursery \
 		-W clippy::correctness -W clippy::complexity \
 		-W clippy::perf -W clippy::style -W clippy::all -D warnings
+
+clippy: clippy-base clippy-full
 
 clippy-fix:
 	cargo clippy --workspace --fix --allow-dirty -- -W clippy::all -W clippy::correctness \

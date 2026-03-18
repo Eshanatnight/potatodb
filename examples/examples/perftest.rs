@@ -94,7 +94,7 @@ fn to_json_value(r: &BenchResult) -> serde_json::Value {
     })
 }
 
-fn stats(timings: &mut Vec<f64>) -> BenchResult {
+fn stats(timings: &mut [f64]) -> BenchResult {
     timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = timings.len();
     let median_ms = if n % 2 == 1 {
