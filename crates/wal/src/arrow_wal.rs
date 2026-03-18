@@ -18,9 +18,9 @@
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Arrow IPC write-ahead log.
@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 pub struct ArrowWal {
     dir: PathBuf,
     seq: u64,
+    /// Table directories already created so we can skip `create_dir_all`.
+    known_dirs: HashSet<String>,
 }
 
 impl ArrowWal {
@@ -45,7 +47,11 @@ impl ArrowWal {
 
         let seq = Self::max_existing_seq(&dir).unwrap_or(0);
 
-        Ok(Self { dir, seq })
+        Ok(Self {
+            dir,
+            seq,
+            known_dirs: HashSet::new(),
+        })
     }
 
     /// Appends `batches` for `table` as a new Arrow IPC file.
@@ -62,13 +68,16 @@ impl ArrowWal {
         let schema = batches[0].schema();
 
         let table_dir = self.dir.join(table);
-        fs::create_dir_all(&table_dir)?;
+        if self.known_dirs.insert(table.to_string()) {
+            fs::create_dir_all(&table_dir)?;
+        }
 
         self.seq += 1;
         let file_path = table_dir.join(format!("{:06}.arrow", self.seq));
 
         let file = fs::File::create(&file_path)?;
-        let mut writer = FileWriter::try_new(file, &schema)
+        let buf_writer = BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = FileWriter::try_new(buf_writer, &schema)
             .map_err(|e| io::Error::other(format!("Arrow IPC writer init: {e}")))?;
 
         for batch in batches {
@@ -80,6 +89,15 @@ impl ArrowWal {
         writer
             .finish()
             .map_err(|e| io::Error::other(format!("Arrow IPC finish: {e}")))?;
+
+        let buf_writer = writer
+            .into_inner()
+            .map_err(|e| io::Error::other(format!("Arrow IPC into_inner: {e}")))?;
+        let mut file = buf_writer
+            .into_inner()
+            .map_err(|e| io::Error::other(format!("BufWriter flush: {e}")))?;
+        file.flush()?;
+        file.sync_data()?;
 
         Ok(())
     }
@@ -145,11 +163,12 @@ impl ArrowWal {
     /// # Errors
     ///
     /// Returns an error if the table directory cannot be removed.
-    pub fn checkpoint_table(&self, table: &str) -> io::Result<()> {
+    pub fn checkpoint_table(&mut self, table: &str) -> io::Result<()> {
         let table_dir = self.dir.join(table);
         if table_dir.exists() {
             fs::remove_dir_all(&table_dir)?;
         }
+        self.known_dirs.remove(table);
         Ok(())
     }
 
@@ -158,7 +177,7 @@ impl ArrowWal {
     /// # Errors
     ///
     /// Returns an error if any table directory cannot be read or removed.
-    pub fn checkpoint_all(&self) -> io::Result<()> {
+    pub fn checkpoint_all(&mut self) -> io::Result<()> {
         if self.dir.exists() {
             for entry in fs::read_dir(&self.dir)? {
                 let entry = entry?;
@@ -167,6 +186,7 @@ impl ArrowWal {
                 }
             }
         }
+        self.known_dirs.clear();
         Ok(())
     }
 

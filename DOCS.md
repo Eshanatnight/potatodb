@@ -10,7 +10,7 @@ Recent engine extensions include:
 
 - additional SQL types (`UUID`, `INTERVAL`, `ARRAY`, `JSON/JSONB`)
 - user-defined SQL functions (`CREATE FUNCTION` / `DROP FUNCTION`)
-- transactions (`BEGIN`, `COMMIT`, `ROLLBACK`) with destructive rewrites, plus `SAVEPOINT`/ `ROLLBACK TO` / `RELEASE SAVEPOINT`
+- transactions (`BEGIN`, `COMMIT`, `ROLLBACK`) with destructive rewrites, plus `SAVEPOINT` / `ROLLBACK TO` / `RELEASE SAVEPOINT`
 - snapshot-based time-travel reads (`AS OF TIMESTAMP`)
 - foreign-key constraints with `RESTRICT` / `CASCADE` / `SET NULL`
 - CDC virtual table (`potatodb_cdc`) with durable disk persistence
@@ -18,18 +18,21 @@ Recent engine extensions include:
 - procedure support (`CREATE PROCEDURE`, `CALL`, `DO $$...$$`)
 - full-text index metadata with `fts_match(...)` rewrite
 - HTTP API crate (`potatodb-http`) and TLS-enabled pgwire server
- - WebSocket support and a new `crates/nodejs` integration crate
- - deletion vectors and partitioning (improved storage layouts)
- - S3-backed WAL support and durable CDC improvements
- - plan cache and query metrics (`QueryMetrics`) with EXPLAIN ANALYZE passthrough
- - compaction and background maintenance (automatic file rewrites)
- - PL/pgSQL compatibility, triggers, and `MERGE` support; built-ins like `generate_series`
- - Prometheus metrics for observability and connection pooling support
-
-Observability: the engine now exports Prometheus metrics and collects per-query
-`QueryMetrics` (used by `EXPLAIN ANALYZE` passthrough and runtime telemetry).
- - persisted RBAC (roles/privileges) stored in the catalog
- - additional TUI meta-commands (`\\dt`, `\\di`, `\\dv`, `\\d`, `\\ds`, `\\df`, `\\du`)
+- WebSocket support and `crates/nodejs` integration crate
+- deletion vectors and partitioning (improved storage layouts)
+- S3-backed WAL support and durable CDC improvements
+- plan cache and query metrics (`QueryMetrics`) with `EXPLAIN ANALYZE` passthrough
+- compaction and background maintenance (automatic file rewrites)
+- PL/pgSQL compatibility, triggers, and `MERGE` support; built-ins like `generate_series`
+- Prometheus metrics for observability and connection pooling support
+- persisted RBAC (roles/privileges) stored in the catalog
+- TUI and REPL meta-commands (`\dt`, `\di`, `\dv`, `\d`, `\ds`, `\df`, `\du`, `\timing`)
+- `\timing` toggle for detailed per-query timing and I/O metrics in REPL and TUI
+- deferred auto-analyze (moved off the insert hot path)
+- buffered Arrow WAL writes with fdatasync and directory caching
+- approximate distinct counts (`APPROX_DISTINCT`) in `ANALYZE`
+- mimalloc purge-delay tuning for reduced `madvise` overhead
+- end-to-end performance test suite (`perftest`) with JSON reporting and baseline comparison
 
 ---
 
@@ -45,12 +48,14 @@ Observability: the engine now exports Prometheus metrics and collects per-query
 8. [S3 integration](#s3-integration)
 9. [REPL](#repl)
 10. [TUI](#tui)
-11. [C / C++ FFI](#c--c-ffi)
-12. [Runtime environment variables](#runtime-environment-variables)
-13. [Workspace layout](#workspace-layout)
-14. [Build & release profiles](#build--release-profiles)
-15. [Formatting conventions](#formatting-conventions)
-16. [Testing](#testing)
+11. [CLI arguments](#cli-arguments)
+12. [CLI file execution](#cli-file-execution)
+13. [C / C++ FFI](#c--c-ffi)
+14. [Runtime environment variables](#runtime-environment-variables)
+15. [Workspace layout](#workspace-layout)
+16. [Build & release profiles](#build--release-profiles)
+17. [Formatting conventions](#formatting-conventions)
+18. [Testing](#testing)
 
 ---
 
@@ -164,6 +169,20 @@ under `_wal/entries.json` in the configured prefix and replayed similarly.
 | `wal`         | `Option<Wal>`             | Local write-ahead log handle           |
 | `write_buffer`| `HashMap<...>`            | Per-table buffered INSERT batches      |
 
+### Deferred auto-analyze
+
+The engine tracks rows written per table and triggers `ANALYZE` after a
+configurable threshold (`POTATODB_AUTO_ANALYZE_ROWS`). Instead of
+running `ANALYZE` synchronously on the insert path, table names are
+pushed to a `pending_analyze_tables` queue. The pending analyses are
+drained at the start of the next `execute()` call, keeping inserts fast.
+
+`ANALYZE` itself uses `APPROX_DISTINCT` (HyperLogLog) instead of exact
+`COUNT(DISTINCT)` for column-level distinct-count statistics, which is
+significantly cheaper on large tables.
+
+### Initialization
+
 On construction (`PotatoDB::new`), the engine:
 
 1. Configures a `SessionConfig` with tuned Parquet options.
@@ -189,6 +208,15 @@ For local backends, PotatoDB uses `crates/wal` as an append-only journal:
 
 `Wal::append()` flushes and `sync_data()`s writes. In S3 mode, WAL entries are
 stored in object storage (`_wal/entries.json`) and replayed on startup.
+
+### Arrow IPC WAL
+
+The `ArrowWal` (used for Arrow IPC-encoded row batches) wraps file
+writes in a 256 KB `BufWriter` and explicitly calls `sync_data()` after
+each append for durability without flushing filesystem metadata. It also
+maintains a `HashSet<String>` of known table directories to skip
+redundant `create_dir_all` syscalls on repeated inserts to the same
+table. The directory cache is cleared on checkpoint.
 
 ---
 
@@ -303,9 +331,9 @@ All tuning knobs are set in `build_session_config()`:
 | `dictionary_enabled`          | `true`      | Dictionary-encode all columns                 |
 | `statistics_enabled`          | `page`      | Write min/max statistics per page             |
 | `max_row_group_size`          | `1,048,576` | Rows per row group                            |
-| `write_batch_size`            | `8,192`     | Parquet write buffer size (env: `POTATODB_PARQUET_WRITE_BATCH_SIZE`) |
+| `write_batch_size`            | `16,384`    | Parquet write buffer size (env: `POTATODB_PARQUET_WRITE_BATCH_SIZE`) |
 | `data_page_row_count_limit`   | `20,000`    | Max rows per data page                        |
-| `batch_size`                  | `8,192`     | Arrow batch size (env: `POTATODB_BATCH_SIZE`) |
+| `batch_size`                  | `32,768`    | Arrow batch size (env: `POTATODB_BATCH_SIZE`) |
 | `target_partitions`           | CPU cores   | Parallel partitions (env: `POTATODB_TARGET_PARTITIONS`) |
 
 ---
@@ -366,17 +394,23 @@ The `potatodb-repl` crate provides a line-mode SQL shell using `rustyline`.
 
 - **Multi-line input** -- lines are buffered until a `;` terminator.
 - **History** -- saved to `~/.potatodb_history` between sessions.
-- **Special commands** -- `\q`, `\dt`, `\d <table>`, `\di`, `\dv`,
+- **Special commands** -- `\q` (also `quit`, `exit`), `\dt`, `\d <table>`,
+  `\di`, `\dv`, `\timing`, `\i <file>` (also `.source <file>`),
   `\backup <archive>`, `\restore <archive>`, `.import`, `.export`.
-- **Timing** -- each query prints row count and wall-clock duration
-  (via `chrono::Utc`).
+- **Timing** -- each query prints row count and wall-clock duration.
+  The `\timing` command toggles detailed per-statement timing with
+  I/O metrics (rows read, bytes scanned, elapsed breakdown).
 
 ---
 
 ## TUI
 
 The `potatodb-tui` crate provides a full-screen terminal UI using
-`ratatui`.
+`ratatui`. It supports a subset of meta-commands: `\dt`, `\di`, `\dv`,
+`\d <table>`, `\ds`, `\df`, `\du`, and `\timing`. File-oriented
+commands (`\i`, `\backup`, `\restore`, `.import`, `.export`) are only
+available in the REPL. The `\timing` command toggles detailed I/O
+metrics in the status bar.
 
 ### Layout
 
@@ -406,6 +440,46 @@ The `potatodb-tui` crate provides a full-screen terminal UI using
 | Tab            | Toggle the table sidebar      |
 | Home / End     | Move cursor to start/end      |
 | Ctrl+C         | Quit                          |
+
+---
+
+## CLI arguments
+
+| Argument | Type | Default | Env | Description |
+|----------|------|---------|-----|-------------|
+| `--data-dir` | `String` | `./potatodb_data` | | Storage location (local path or `s3://` URL) |
+| `--s3-endpoint` | `String` | | | S3-compatible endpoint URL |
+| `--s3-region` | `String` | `us-east-1` | | AWS/S3 region |
+| `--s3-allow-http` | `bool` | `false` | | Allow plain HTTP to S3 (for MinIO, etc.) |
+| `--wal-dir` | `String` | | | Separate directory for write-ahead logs |
+| `--repl` | `bool` | `false` | | Use line-mode REPL instead of TUI |
+| `--theme` | `String` | `potato` | `POTATODB_THEME` | TUI colour theme (`potato`, `catppuccin-mocha`) |
+| `-f`, `--file` | `Vec<String>` | | | SQL file(s) to execute non-interactively |
+| `--timing` | `bool` | `false` | | Print total execution time for file mode |
+| `--http-addr` | `String` | | | Start the HTTP API server on this address |
+
+---
+
+## CLI file execution
+
+The `potatodb` binary accepts one or more `--file` / `-f` arguments to
+execute SQL files non-interactively. Output is formatted identically to
+the REPL (ASCII tables via `format_batches_truncated`, row counts, and
+simplified error messages).
+
+```bash
+# Execute a single file
+cargo run --release -- -f schema.sql
+
+# Execute multiple files in order
+cargo run --release -- -f schema.sql -f seed.sql -f queries.sql
+
+# Show total elapsed time at the end
+cargo run --release -- -f workload.sql --timing
+```
+
+When `--timing` is enabled, the total wall-clock time for all file
+execution is printed at the end.
 
 ---
 
@@ -498,20 +572,28 @@ A `CMakeLists.txt` is provided in `crates/ffi/` for CMake integration.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `POTATODB_WAL_CHECKPOINT_BYTES` | `4194304` | Checkpoint WAL when it grows beyond this size |
+| `POTATODB_WAL_CHECKPOINT_BYTES` | `4294967296` | Checkpoint WAL when it grows beyond this size (4 GB) |
 | `POTATODB_WRITE_BUFFER_ROWS` | `10000` | Flush buffered inserts when row threshold is reached |
 | `POTATODB_WRITE_BUFFER_BYTES` | `67108864` | Flush buffered inserts when byte threshold is reached |
-| `POTATODB_WRITE_BUFFER_MS` | `5000` | Flush buffered inserts when oldest buffered rows age out |
+| `POTATODB_WRITE_BUFFER_MS` | `360000` | Flush buffered inserts when oldest buffered rows age out (360 s) |
 | `POTATODB_AUTO_ANALYZE_ROWS` | `10000` | Run `ANALYZE` automatically after this many written rows |
 | `POTATODB_SLOW_QUERY_MS` | `500` | Slow-query warning threshold |
 | `POTATODB_QUERY_LOG_MAX` | `200` | In-memory recent-query log capacity |
 | `POTATODB_CDC_CAPACITY` | `2000` | Maximum CDC events kept in memory |
 | `POTATODB_SNAPSHOT_RETENTION_MS` | `86400000` | Snapshot retention window for time-travel queries |
-| `POTATODB_BATCH_SIZE` | `8192` | DataFusion Arrow batch size during execution |
-| `POTATODB_PARQUET_WRITE_BATCH_SIZE` | `8192` | Parquet write buffer size per batch |
+| `POTATODB_BATCH_SIZE` | `32768` | DataFusion Arrow batch size during execution |
+| `POTATODB_PARQUET_WRITE_BATCH_SIZE` | `16384` | Parquet write buffer size per batch |
 | `POTATODB_TARGET_PARTITIONS` | CPU cores | Number of parallel execution partitions |
 | `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` | `true` | Enforce batch size in hash joins (reduces memory churn) |
 | `POTATODB_COALESCE_BATCHES` | `true` | Coalesce small batches between operators |
+| `POTATODB_PARQUET_COMPRESSION` | `zstd(3)` | Parquet compression algorithm (`zstd(N)`, `snappy`, `gzip(N)`, `brotli(N)`, `lz4`, `lz4_raw`, `uncompressed`) |
+| `POTATODB_THEME` | `potato` | TUI colour theme (`potato`, `catppuccin-mocha`) |
+
+### Allocator
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MIMALLOC_PURGE_DELAY` | `10` | Seconds before mimalloc returns memory to the OS (set automatically at startup if unset) |
 
 ### Server
 
@@ -533,10 +615,12 @@ A `CMakeLists.txt` is provided in `crates/ffi/` for CMake integration.
 ```
 potatodb/
   Cargo.toml                   workspace root + shared dependency versions
+  Makefile                     build, test, format, perftest targets
   rustfmt.toml                 formatting rules (applied workspace-wide)
   .cargo/config.toml           RUSTFLAGS=-C target-cpu=native
   README.md                    user-facing overview
   DOCS.md                      this file
+  sample_data.sql              large sample dataset for profiling
   crates/
     catalog/                   potatodb-catalog
     display/                   potatodb-display
@@ -551,9 +635,12 @@ potatodb/
       CMakeLists.txt           CMake build for C++ consumers
     python/                    potatodb-python bindings (PyO3)
     http/                      potatodb-http (REST API)
+    nodejs/                    potatodb-nodejs (Node.js integration)
     repl/                      potatodb-repl
     tui/                       potatodb-tui
     potatodb/                  binary entry point
+  examples/
+    examples/perftest.rs       end-to-end performance test binary
 ```
 
 All dependency versions are centralized under `[workspace.dependencies]`
@@ -646,6 +733,53 @@ cargo test -p potatodb-engine
 # Run a single test by name
 cargo test -p potatodb-engine test_create_index_sorts_data
 ```
+
+### Performance testing
+
+The `examples/examples/perftest.rs` binary runs an end-to-end workload
+covering bulk inserts, point lookups, full scans, aggregations, joins,
+subqueries, CTEs, window functions, sorting, DML, DDL, and transactions.
+Each benchmark is repeated for a configurable number of iterations, and
+the results include median, mean, min, max, and p95 timings.
+
+```bash
+# Run with defaults (scale=1, iterations=3)
+make perftest
+
+# Save a JSON baseline
+make perf-save
+
+# Run and compare against the saved baseline
+make perf-compare
+
+# Custom parameters
+make perftest PERF_SCALE=2 PERF_ITERS=5
+```
+
+The JSON report structure:
+
+```json
+{
+  "timestamp": 1710000000,
+  "scale": 1,
+  "iterations": 3,
+  "seed_ms": 1234.5,
+  "benchmarks": {
+    "bulk_insert_1000": {
+      "median_ms": 12.3,
+      "mean_ms": 13.1,
+      "min_ms": 11.0,
+      "max_ms": 16.0,
+      "p95_ms": 15.8,
+      "iterations": 3
+    }
+  }
+}
+```
+
+When `--baseline <path>` is provided, the test prints a formatted
+comparison table showing the delta percentage for each benchmark
+relative to the baseline.
 
 ### Generating rustdoc
 

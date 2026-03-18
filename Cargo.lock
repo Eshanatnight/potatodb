@@ -3725,9 +3725,11 @@ dependencies = [
 name = "potatodb-examples"
 version = "1.0.0"
 dependencies = [
+ "arrow",
  "potatodb-display",
  "potatodb-engine",
  "potatodb-server",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -3782,7 +3784,6 @@ dependencies = [
 name = "potatodb-repl"
 version = "1.0.0"
 dependencies = [
- "chrono",
  "potatodb-display",
  "potatodb-engine",
  "rustyline",

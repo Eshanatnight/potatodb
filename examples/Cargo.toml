@@ -6,8 +6,10 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+arrow.workspace = true
 potatodb-engine.workspace = true
 potatodb-display.workspace = true
 potatodb-server.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
