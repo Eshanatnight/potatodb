@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Controls when the Arrow WAL forces data to stable storage.
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub enum ArrowWalSyncPolicy {
     /// `sync_data()` after every `append`.
+    #[default]
     Always,
     /// `sync_data()` every N `append` calls (best-effort).
     EveryNAppends(u64),
@@ -35,12 +36,6 @@ pub enum ArrowWalSyncPolicy {
     EveryInterval(Duration),
     /// Never call `sync_data()` (fastest, least durable).
     Never,
-}
-
-impl Default for ArrowWalSyncPolicy {
-    fn default() -> Self {
-        Self::Always
-    }
 }
 
 /// Configuration for `ArrowWal`.
@@ -167,7 +162,9 @@ impl ArrowWal {
         self.appends_since_sync = self.appends_since_sync.saturating_add(1);
         let should_sync = match self.cfg.sync_policy {
             ArrowWalSyncPolicy::Always => true,
-            ArrowWalSyncPolicy::EveryNAppends(n) => n > 0 && (self.appends_since_sync % n == 0),
+            ArrowWalSyncPolicy::EveryNAppends(n) => {
+                n > 0 && self.appends_since_sync.is_multiple_of(n)
+            }
             ArrowWalSyncPolicy::EveryInterval(d) => d.is_zero() || self.last_sync_at.elapsed() >= d,
             ArrowWalSyncPolicy::Never => false,
         };
