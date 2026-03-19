@@ -83,6 +83,10 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use url::Url;
 
+mod checkpoint_policy;
+mod sql_helpers;
+
+use checkpoint_policy::should_checkpoint_autocommit;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -92,6 +96,9 @@ use potatodb_catalog::{
     TableStatistics, TriggerDef, UdfDef, ViewDef,
 };
 use potatodb_wal::{ArrowWal, EntryStatus, Wal, WalEntry};
+use sql_helpers::{
+    is_read_only_sql, normalize_explain_sql, parse_as_of_timestamp, strip_as_of_timestamp,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -424,6 +431,14 @@ pub struct PotatoDB {
     max_query_log_entries: usize,
     /// WAL size threshold for periodic autocommit checkpoints.
     wal_checkpoint_threshold_bytes: u64,
+    /// Additional checkpoint trigger by committed autocommit operations.
+    wal_checkpoint_every_commits: u64,
+    /// Additional checkpoint trigger by elapsed time since last checkpoint.
+    wal_checkpoint_interval: Duration,
+    /// Number of autocommit writes since the last WAL checkpoint.
+    wal_commits_since_checkpoint: u64,
+    /// Instant when the last WAL checkpoint finished.
+    last_wal_checkpoint_at: Instant,
     /// Per-table in-memory buffered INSERT data.
     write_buffer: HashMap<String, BufferedInsert>,
     /// Flush threshold by buffered row count.
@@ -752,6 +767,14 @@ impl PotatoDB {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(4 * 1024 * 1024 * 1024);
+        let wal_checkpoint_every_commits = std::env::var("POTATODB_WAL_CHECKPOINT_COMMITS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let wal_checkpoint_interval = std::env::var("POTATODB_WAL_CHECKPOINT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(Duration::from_secs(0), Duration::from_millis);
         let write_buffer_row_threshold = std::env::var("POTATODB_WRITE_BUFFER_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -823,6 +846,10 @@ impl PotatoDB {
             slow_query_threshold_ms,
             max_query_log_entries,
             wal_checkpoint_threshold_bytes,
+            wal_checkpoint_every_commits,
+            wal_checkpoint_interval,
+            wal_commits_since_checkpoint: 0,
+            last_wal_checkpoint_at: Instant::now(),
             write_buffer: HashMap::new(),
             write_buffer_row_threshold,
             write_buffer_byte_threshold,
@@ -1156,13 +1183,40 @@ impl PotatoDB {
         }
         if let Some(wal) = self.wal.as_mut() {
             wal.commit_no_checkpoint(0)?;
-            if force_checkpoint {
+            self.wal_commits_since_checkpoint = self.wal_commits_since_checkpoint.saturating_add(1);
+            let elapsed = self.last_wal_checkpoint_at.elapsed();
+            if should_checkpoint_autocommit(
+                force_checkpoint,
+                self.wal_commits_since_checkpoint,
+                self.wal_checkpoint_every_commits,
+                elapsed,
+                self.wal_checkpoint_interval,
+            ) {
                 wal.checkpoint()?;
+                self.wal_commits_since_checkpoint = 0;
+                self.last_wal_checkpoint_at = Instant::now();
             } else {
                 wal.maybe_checkpoint(self.wal_checkpoint_threshold_bytes)?;
             }
         }
         Ok(())
+    }
+
+    fn handle_checkpoint(&mut self) -> Result<QueryResult, BoxError> {
+        if self.in_transaction() {
+            return Err("CHECKPOINT is not allowed in an explicit transaction".into());
+        }
+        if let Some(wal) = self.wal.as_mut() {
+            wal.checkpoint()?;
+            self.wal_commits_since_checkpoint = 0;
+            self.last_wal_checkpoint_at = Instant::now();
+        }
+        if let Some(awal) = self.arrow_wal.as_mut() {
+            awal.checkpoint_all()?;
+        }
+        Ok(QueryResult::Message(
+            "Checkpoint completed for WAL and Arrow WAL.".to_string(),
+        ))
     }
 
     fn next_temp_table_name(&mut self, tag: &str) -> String {
@@ -2092,6 +2146,37 @@ impl PotatoDB {
         Ok(results)
     }
 
+    /// Executes statements from a SQL file and invokes `on_result` after each statement.
+    ///
+    /// This allows callers to stream output (e.g. printing each statement's
+    /// result immediately) instead of waiting for full-file completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL file cannot be read.
+    pub async fn execute_file_with_callback<F>(
+        &mut self,
+        path: &str,
+        continue_on_error: bool,
+        mut on_result: F,
+    ) -> Result<(), BoxError>
+    where
+        F: FnMut(&str, &Result<QueryResult, BoxError>),
+    {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read SQL file '{path}': {e}"))?;
+        let statements = split_sql_statements(&contents);
+        for stmt in statements {
+            let result = self.execute(&stmt).await;
+            let is_err = result.is_err();
+            on_result(&stmt, &result);
+            if is_err && !continue_on_error {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // ── SQL dispatch ───────────────────────────────────────────
 
     /// Parses and executes a single SQL statement.
@@ -2173,6 +2258,10 @@ impl PotatoDB {
 
         if upper.starts_with("SELECT ") && upper.contains("FROM POTATODB_CDC") {
             let result = self.handle_select_cdc(trimmed);
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("SELECT ") && upper.contains("FROM POTATODB_SYSTEM_STATUS") {
+            let result = self.handle_select_system_status();
             return self.finalize_query(sql, started_at, result);
         }
 
@@ -2344,6 +2433,11 @@ impl PotatoDB {
             if result.is_ok() {
                 self.wal_finish_autocommit(true)?;
             }
+            self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper == "CHECKPOINT" || upper == "CHECKPOINT;" {
+            let result = self.handle_checkpoint();
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
@@ -3042,6 +3136,42 @@ impl PotatoDB {
                 Arc::new(op_arr),
                 Arc::new(ts_arr),
                 Arc::new(row_arr),
+            ],
+        )?;
+        Ok(QueryResult::Records(vec![batch]))
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn handle_select_system_status(&self) -> Result<QueryResult, BoxError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("plan_cache_entries", DataType::Int64, false),
+            Field::new("plan_cache_hits", DataType::Int64, false),
+            Field::new("query_log_entries", DataType::Int64, false),
+            Field::new("snapshots", DataType::Int64, false),
+            Field::new("wal_commits_since_checkpoint", DataType::Int64, false),
+            Field::new("wal_checkpoint_threshold_bytes", DataType::Int64, false),
+            Field::new("last_query_parquet_files_read", DataType::Int64, false),
+            Field::new("last_query_bytes_scanned", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![self.plan_cache.len() as i64])),
+                Arc::new(Int64Array::from(vec![self.plan_cache_hits as i64])),
+                Arc::new(Int64Array::from(vec![self.query_log.len() as i64])),
+                Arc::new(Int64Array::from(vec![self.snapshots.len() as i64])),
+                Arc::new(Int64Array::from(vec![
+                    self.wal_commits_since_checkpoint as i64,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.wal_checkpoint_threshold_bytes as i64,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.last_query_metrics.parquet_files_read as i64,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.last_query_metrics.bytes_scanned as i64,
+                ])),
             ],
         )?;
         Ok(QueryResult::Records(vec![batch]))
@@ -5750,6 +5880,8 @@ impl PotatoDB {
             .iter()
             .map(arrow::array::RecordBatch::num_rows)
             .sum();
+        let mut missing_target_cols = 0usize;
+        let mut source_only_cols = 0usize;
 
         if total_rows > 0 {
             let schema = batches[0].schema();
@@ -5778,11 +5910,16 @@ impl PotatoDB {
                     if source_fields.contains(col_name) {
                         format!("\"{col_name}\"")
                     } else {
+                        missing_target_cols = missing_target_cols.saturating_add(1);
                         format!("NULL AS \"{col_name}\"")
                     }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            source_only_cols = source_fields
+                .iter()
+                .filter(|name| !target_cols.iter().any(|c| c == *name))
+                .count();
             let target_col_list = target_cols
                 .iter()
                 .map(|c| format!("\"{c}\""))
@@ -5806,7 +5943,7 @@ impl PotatoDB {
         self.record_cdc_event(table_name, "COPY_FROM", total_rows);
 
         Ok(QueryResult::Message(format!(
-            "{total_rows} row(s) copied into '{table_name}'."
+            "{total_rows} row(s) copied into '{table_name}' from '{file_path}' ({format}); missing target columns filled with NULL: {missing_target_cols}, source-only columns ignored: {source_only_cols}."
         )))
     }
 
@@ -6524,14 +6661,6 @@ fn substitute_parameters(template: &str, params: &[sqlparser::ast::Expr]) -> Str
         i += 1;
     }
     result
-}
-
-fn is_read_only_sql(sql: &str) -> bool {
-    let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
-    matches!(
-        first.as_str(),
-        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "EXPLAIN"
-    )
 }
 
 /// Extracts base table names from a read-only SQL string (SELECT, WITH, etc.).
@@ -7521,79 +7650,7 @@ fn array_value_to_sql_literal(array: &dyn Array, row: usize) -> String {
     )
 }
 
-/// Rewrites PostgreSQL-style `EXPLAIN (FORMAT JSON)` into `DataFusion`'s
-/// accepted form by stripping unsupported option lists.
-fn normalize_explain_sql(sql: &str) -> String {
-    let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
-    if upper.starts_with("EXPLAIN (") {
-        let open_idx = trimmed.find('(');
-        let close_idx = trimmed.find(')');
-        if let (Some(open), Some(close)) = (open_idx, close_idx) {
-            if close > open {
-                let opts = upper[open + 1..close].trim();
-                let has_analyze = opts.split(',').any(|o| o.trim() == "ANALYZE");
-                let rest = trimmed[close + 1..].trim();
-                if !rest.is_empty() {
-                    return if has_analyze {
-                        format!("EXPLAIN ANALYZE {rest}")
-                    } else {
-                        format!("EXPLAIN {rest}")
-                    };
-                }
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
-/// Strips `AS OF TIMESTAMP '...'` from a SQL statement.
-fn strip_as_of_timestamp(sql: &str) -> String {
-    let upper = sql.to_uppercase();
-    let Some(idx) = upper.find(" AS OF TIMESTAMP ") else {
-        return sql.to_string();
-    };
-    let after = &sql[idx + " AS OF TIMESTAMP ".len()..];
-    let mut skip = 0usize;
-    if let Some(stripped) = after.strip_prefix('\'') {
-        if let Some(end_quote) = stripped.find('\'') {
-            skip = 1 + end_quote + 1;
-        }
-    } else {
-        skip = after.find(' ').unwrap_or(after.len());
-    }
-    let mut rewritten = String::new();
-    rewritten.push_str(&sql[..idx]);
-    rewritten.push_str(after.get(skip..).unwrap_or_default());
-    rewritten
-}
-
-fn parse_as_of_timestamp(sql: &str) -> Option<i64> {
-    let upper = sql.to_uppercase();
-    let idx = upper.find(" AS OF TIMESTAMP ")?;
-    let after = sql[idx + " AS OF TIMESTAMP ".len()..].trim_start();
-    let token = if let Some(stripped) = after.strip_prefix('\'') {
-        let end = stripped.find('\'')?;
-        stripped[..end].to_string()
-    } else {
-        after
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(';')
-            .to_string()
-    };
-    if token.is_empty() {
-        return None;
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&token) {
-        return Some(dt.timestamp_millis());
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&token, "%Y-%m-%d %H:%M:%S") {
-        return Some(naive.and_utc().timestamp_millis());
-    }
-    token.parse::<i64>().ok()
-}
+// SQL helper routines are maintained in `sql_helpers` to keep this file smaller.
 
 /// Converts a sqlparser column definition into a catalog [`ColumnDef`].
 fn sql_column_to_catalog(col: &SqlColumnDef) -> ColumnDef {

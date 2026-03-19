@@ -313,25 +313,25 @@ fn print_timing(elapsed: std::time::Duration, metrics: &potatodb_engine::QueryMe
 async fn execute_file_and_print(db: &mut PotatoDB, path: &str, timing: bool) {
     println!("Executing: {path}");
     let file_start = Instant::now();
-    match db.execute_file(path, true).await {
-        Ok(results) => {
-            for (_stmt, result) in results {
-                match result {
-                    Ok(QueryResult::Records(batches)) => {
-                        println!("{}", display::format_batches_truncated(&batches));
-                        println!("({} row(s))", display::row_count(&batches));
-                        println!();
-                    }
-                    Ok(QueryResult::Message(msg)) => {
-                        println!("{msg}");
-                        println!();
-                    }
-                    Err(e) => {
-                        eprintln!("ERROR: {e}");
-                        eprintln!();
-                    }
-                }
+    match db
+        .execute_file_with_callback(path, true, |_stmt, result| match result {
+            Ok(QueryResult::Records(batches)) => {
+                println!("{}", display::format_batches_truncated(batches));
+                println!("({} row(s))", display::row_count(batches));
+                println!();
             }
+            Ok(QueryResult::Message(msg)) => {
+                println!("{msg}");
+                println!();
+            }
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                eprintln!();
+            }
+        })
+        .await
+    {
+        Ok(()) => {
             if timing {
                 let total = file_start.elapsed();
                 println!(

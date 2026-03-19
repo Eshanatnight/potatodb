@@ -84,29 +84,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for path in &cli.files {
             println!("Executing: {path}");
             let file_start = Instant::now();
-            match db.execute_file(path, false).await {
-                Ok(results) => {
-                    for (_stmt, result) in results {
-                        match result {
-                            Ok(QueryResult::Records(batches)) => {
-                                println!(
-                                    "{}",
-                                    potatodb_display::format_batches_truncated(&batches)
-                                );
-                                println!("({} row(s))", potatodb_display::row_count(&batches));
-                                println!();
-                            }
-                            Ok(QueryResult::Message(msg)) => {
-                                println!("{msg}");
-                                println!();
-                            }
-                            Err(e) => {
-                                eprintln!("ERROR: {e}");
-                                eprintln!();
-                                had_error = true;
-                            }
-                        }
+            match db
+                .execute_file_with_callback(path, false, |_stmt, result| match result {
+                    Ok(QueryResult::Records(batches)) => {
+                        println!("{}", potatodb_display::format_batches_truncated(batches));
+                        println!("({} row(s))", potatodb_display::row_count(batches));
+                        println!();
                     }
+                    Ok(QueryResult::Message(msg)) => {
+                        println!("{msg}");
+                        println!();
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: {e}");
+                        eprintln!();
+                        had_error = true;
+                    }
+                })
+                .await
+            {
+                Ok(()) => {
                     if show_timing {
                         let total = file_start.elapsed();
                         println!(
