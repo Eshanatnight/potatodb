@@ -617,7 +617,7 @@ potatodb/
   Cargo.toml                   workspace root + shared dependency versions
   Makefile                     build, test, format, perftest targets
   rustfmt.toml                 formatting rules (applied workspace-wide)
-  .cargo/config.toml           RUSTFLAGS=-C target-cpu=native
+  .cargo/config.toml           (optional: RUSTFLAGS=-C target-cpu=native for local SIMD)
   README.md                    user-facing overview
   DOCS.md                      this file
   sample_data.sql              large sample dataset for profiling
@@ -676,10 +676,10 @@ The release profile in the root `Cargo.toml` enables:
 | `strip`             | `true`   | Strip debug symbols from the binary                 |
 | `panic`             | `"abort"`| Remove unwind tables for smaller, faster code       |
 
-Additionally, `.cargo/config.toml` sets `RUSTFLAGS = -C target-cpu=native`
-so the compiler emits AVX2/AVX-512/NEON instructions available on the
-build machine. This significantly benefits Arrow's columnar operations
-and Parquet codec hot paths.
+For local builds, you can set `RUSTFLAGS="-C target-cpu=native"` so the
+compiler emits AVX2/AVX-512/NEON instructions available on your machine.
+This significantly benefits Arrow's columnar operations and Parquet codec
+hot paths. (Not enabled by default to avoid SIGILL on CI runners.)
 
 ---
 

@@ -1,2 +1,4 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Optional: for local dev with AVX2/AVX-512 SIMD, set RUSTFLAGS="-C target-cpu=native"
+# Not set here because target-cpu=native causes SIGILL on CI (GitHub Actions runners).
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
