@@ -542,7 +542,7 @@ The DataFusion session is configured with:
 - **Buffered WAL writes** -- Arrow IPC WAL uses 256 KB buffered I/O with explicit `fdatasync`
 - **Tuned allocator** -- mimalloc with a 10-second purge delay to reduce `madvise` overhead
 
-The release profile enables full cross-crate LTO, single codegen unit, and `.cargo/config.toml` sets `target-cpu=native` for AVX2/AVX-512 SIMD vectorization in Arrow and Parquet codecs.
+The release profile uses single codegen unit. For AVX2/AVX-512 SIMD vectorization in Arrow and Parquet codecs, set `RUSTFLAGS="-C target-cpu=native"` when building locally (not used in CI to avoid SIGILL on GitHub Actions runners).
 
 ## Runtime tuning
 

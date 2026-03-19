@@ -1334,10 +1334,10 @@ The release profile maximizes single-threaded performance:
 | `strip` | true | Strip debug symbols |
 | `panic` | `"abort"` | Remove unwind tables |
 
-`.cargo/config.toml` sets `RUSTFLAGS = -C target-cpu=native`, which
-enables AVX2, AVX-512, or NEON SIMD instructions depending on the
-build machine. This significantly benefits Arrow's columnar
-operations and Parquet codec paths.
+For local builds, `RUSTFLAGS="-C target-cpu=native"` enables AVX2,
+AVX-512, or NEON SIMD instructions depending on the build machine.
+This significantly benefits Arrow's columnar operations and Parquet
+codec paths. (Not set in config to avoid SIGILL on CI.)
 
 ### Runtime optimizations
 
