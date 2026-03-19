@@ -2146,6 +2146,37 @@ impl PotatoDB {
         Ok(results)
     }
 
+    /// Executes statements from a SQL file and invokes `on_result` after each statement.
+    ///
+    /// This allows callers to stream output (e.g. printing each statement's
+    /// result immediately) instead of waiting for full-file completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL file cannot be read.
+    pub async fn execute_file_with_callback<F>(
+        &mut self,
+        path: &str,
+        continue_on_error: bool,
+        mut on_result: F,
+    ) -> Result<(), BoxError>
+    where
+        F: FnMut(&str, &Result<QueryResult, BoxError>),
+    {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read SQL file '{path}': {e}"))?;
+        let statements = split_sql_statements(&contents);
+        for stmt in statements {
+            let result = self.execute(&stmt).await;
+            let is_err = result.is_err();
+            on_result(&stmt, &result);
+            if is_err && !continue_on_error {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // ── SQL dispatch ───────────────────────────────────────────
 
     /// Parses and executes a single SQL statement.
