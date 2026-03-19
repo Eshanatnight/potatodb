@@ -3,40 +3,23 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch: {}
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (example: v1.2.3)"
+        required: true
+        type: string
 
 permissions:
   contents: write
-  packages: write
 
 jobs:
-  create-release:
-    name: Create release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Create GitHub release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: ${{ github.ref_name }}
-          body: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-
   build:
-    name: Build and upload assets
-    needs: create-release
+    name: Build release assets (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -47,16 +30,18 @@ jobs:
             name: macos
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
-          override: true
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
-      - name: Build (release)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release artifacts
         run: cargo build --workspace --release --locked
 
       - name: Run tests
@@ -66,36 +51,68 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          ZIP=potatodb-${{ matrix.name }}.zip
-          rm -f "$ZIP"
-          # Collect main binary and any ffi artifacts produced by the ffi crate
-          FILES=(target/release/potatodb target/release/libpotatodb_ffi.* target/release/libpotatodb_ffi.a)
-          for f in "${FILES[@]}"; do
-            for match in $f; do
-              if [ -e "$match" ]; then
-                zip -j "$ZIP" "$match"
-              fi
-            done
+          ARCHIVE="potatodb-${{ matrix.name }}.zip"
+          rm -f "$ARCHIVE"
+          FILES=(
+            target/release/potatodb
+            target/release/libpotatodb_ffi.so
+            target/release/libpotatodb_ffi.dylib
+            target/release/libpotatodb_ffi.a
+          )
+
+          packaged=0
+          for file in "${FILES[@]}"; do
+            if [ -f "$file" ]; then
+              zip -j "$ARCHIVE" "$file"
+              packaged=$((packaged + 1))
+            fi
           done
+
+          if [ "$packaged" -eq 0 ]; then
+            echo "No release files found to package." >&2
+            exit 1
+          fi
 
       - name: Package binary and FFI libs (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          $zip = "potatodb-${{ matrix.name }}.zip"
-          if (Test-Path $zip) { Remove-Item $zip }
-          $items = @()
-          if (Test-Path target\release\potatodb.exe) { $items += "target\release\potatodb.exe" }
-          if (Test-Path target\release\potatodb_ffi.dll) { $items += "target\release\potatodb_ffi.dll" }
-          if (Test-Path target\release\potatodb_ffi.lib) { $items += "target\release\potatodb_ffi.lib" }
-          if ($items.Count -eq 0) { New-Item -Path $zip -ItemType File | Out-Null } else { Compress-Archive -Path $items -DestinationPath $zip -Force }
+          $archive = "potatodb-${{ matrix.name }}.zip"
+          if (Test-Path $archive) { Remove-Item $archive -Force }
 
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          $files = @(
+            "target\release\potatodb.exe",
+            "target\release\potatodb_ffi.dll",
+            "target\release\potatodb_ffi.lib"
+          ) | Where-Object { Test-Path $_ }
+
+          if ($files.Count -eq 0) {
+            Write-Error "No release files found to package."
+            exit 1
+          }
+
+          Compress-Archive -Path $files -DestinationPath $archive -Force
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./potatodb-${{ matrix.name }}.zip
-          asset_name: potatodb-${{ matrix.name }}.zip
-          asset_content_type: application/zip
+          name: potatodb-${{ matrix.name }}
+          path: potatodb-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: release-assets/**/*.zip
+          generate_release_notes: true
