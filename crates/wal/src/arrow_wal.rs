@@ -20,8 +20,40 @@ use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// Controls when the Arrow WAL forces data to stable storage.
+#[derive(Default, Debug, Clone, Copy)]
+pub enum ArrowWalSyncPolicy {
+    /// `sync_data()` after every `append`.
+    #[default]
+    Always,
+    /// `sync_data()` every N `append` calls (best-effort).
+    EveryNAppends(u64),
+    /// `sync_data()` at most once per interval (best-effort).
+    EveryInterval(Duration),
+    /// Never call `sync_data()` (fastest, least durable).
+    Never,
+}
+
+/// Configuration for `ArrowWal`.
+#[derive(Debug, Clone, Copy)]
+pub struct ArrowWalConfig {
+    pub sync_policy: ArrowWalSyncPolicy,
+    /// Initial capacity for the reusable IPC scratch buffer.
+    pub scratch_capacity_bytes: usize,
+}
+
+impl Default for ArrowWalConfig {
+    fn default() -> Self {
+        Self {
+            sync_policy: ArrowWalSyncPolicy::Always,
+            scratch_capacity_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
 
 /// Arrow IPC write-ahead log.
 ///
@@ -33,6 +65,10 @@ pub struct ArrowWal {
     seq: u64,
     /// Table directories already created so we can skip `create_dir_all`.
     known_dirs: HashSet<String>,
+    cfg: ArrowWalConfig,
+    scratch: Vec<u8>,
+    appends_since_sync: u64,
+    last_sync_at: Instant,
 }
 
 impl ArrowWal {
@@ -42,6 +78,15 @@ impl ArrowWal {
     ///
     /// Returns an error if the directory cannot be created or read.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_config(dir, ArrowWalConfig::default())
+    }
+
+    /// Opens (or creates) the Arrow WAL directory with a custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or read.
+    pub fn open_with_config(dir: impl AsRef<Path>, cfg: ArrowWalConfig) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
@@ -51,6 +96,10 @@ impl ArrowWal {
             dir,
             seq,
             known_dirs: HashSet::new(),
+            cfg,
+            scratch: Vec::with_capacity(cfg.scratch_capacity_bytes),
+            appends_since_sync: 0,
+            last_sync_at: Instant::now(),
         })
     }
 
@@ -75,9 +124,23 @@ impl ArrowWal {
         self.seq += 1;
         let file_path = table_dir.join(format!("{:06}.arrow", self.seq));
 
-        let file = fs::File::create(&file_path)?;
-        let buf_writer = BufWriter::with_capacity(256 * 1024, file);
-        let mut writer = FileWriter::try_new(buf_writer, &schema)
+        // Encode into a reusable in-memory buffer first to avoid repeated
+        // small allocations inside the IPC writer path.
+        self.scratch.clear();
+        let approx = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>();
+        // IPC overhead varies; reserve a bit more than the raw array memory.
+        let target_cap = approx
+            .saturating_mul(2)
+            .max(self.cfg.scratch_capacity_bytes);
+        if self.scratch.capacity() < target_cap {
+            self.scratch.reserve(target_cap - self.scratch.capacity());
+        }
+
+        let cursor = Cursor::new(&mut self.scratch);
+        let mut writer = FileWriter::try_new(cursor, &schema)
             .map_err(|e| io::Error::other(format!("Arrow IPC writer init: {e}")))?;
 
         for batch in batches {
@@ -90,14 +153,27 @@ impl ArrowWal {
             .finish()
             .map_err(|e| io::Error::other(format!("Arrow IPC finish: {e}")))?;
 
-        let buf_writer = writer
-            .into_inner()
-            .map_err(|e| io::Error::other(format!("Arrow IPC into_inner: {e}")))?;
-        let mut file = buf_writer
-            .into_inner()
-            .map_err(|e| io::Error::other(format!("BufWriter flush: {e}")))?;
-        file.flush()?;
-        file.sync_data()?;
+        // Persist the encoded bytes to disk.
+        let file = fs::File::create(&file_path)?;
+        let mut buf_writer = BufWriter::with_capacity(256 * 1024, file);
+        buf_writer.write_all(&self.scratch)?;
+        buf_writer.flush()?;
+
+        self.appends_since_sync = self.appends_since_sync.saturating_add(1);
+        let should_sync = match self.cfg.sync_policy {
+            ArrowWalSyncPolicy::Always => true,
+            ArrowWalSyncPolicy::EveryNAppends(n) => {
+                n > 0 && self.appends_since_sync.is_multiple_of(n)
+            }
+            ArrowWalSyncPolicy::EveryInterval(d) => d.is_zero() || self.last_sync_at.elapsed() >= d,
+            ArrowWalSyncPolicy::Never => false,
+        };
+
+        if should_sync {
+            buf_writer.get_ref().sync_data()?;
+            self.last_sync_at = Instant::now();
+            self.appends_since_sync = 0;
+        }
 
         Ok(())
     }
@@ -218,6 +294,7 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -332,5 +409,31 @@ mod tests {
         let recovered = ArrowWal::recover(&dir).unwrap();
         let rows: usize = recovered["t1"].iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2);
+    }
+
+    #[test]
+    fn test_open_with_config_and_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("_arrow_wal");
+
+        let cfg = ArrowWalConfig {
+            sync_policy: ArrowWalSyncPolicy::EveryNAppends(10),
+            scratch_capacity_bytes: 128 * 1024,
+        };
+        let mut wal = ArrowWal::open_with_config(&dir, cfg).unwrap();
+        wal.append("t1", &[test_batch(&[1], &["a"])]).unwrap();
+
+        let recovered = ArrowWal::recover(&dir).unwrap();
+        assert_eq!(recovered["t1"][0].num_rows(), 1);
+
+        let cfg2 = ArrowWalConfig {
+            sync_policy: ArrowWalSyncPolicy::EveryInterval(Duration::from_millis(50)),
+            scratch_capacity_bytes: 128 * 1024,
+        };
+        let mut wal2 = ArrowWal::open_with_config(&dir, cfg2).unwrap();
+        wal2.append("t2", &[test_batch(&[2], &["b"])]).unwrap();
+
+        let recovered2 = ArrowWal::recover(&dir).unwrap();
+        assert!(recovered2.contains_key("t2"));
     }
 }

@@ -698,7 +698,47 @@ impl PotatoDB {
         let replay_entries = Wal::recover(&wal_path)?;
         let wal = Some(Wal::open(&wal_path)?);
         let arrow_wal_dir = wal_base_dir.join("_arrow_wal");
-        let arrow_wal = Some(ArrowWal::open(&arrow_wal_dir)?);
+        let arrow_wal_sync = std::env::var("POTATODB_ARROW_WAL_SYNC")
+            .ok()
+            .unwrap_or_else(|| "always".to_string())
+            .to_ascii_lowercase();
+        let arrow_wal_sync_every_n = std::env::var("POTATODB_ARROW_WAL_SYNC_EVERY_N")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let arrow_wal_sync_ms = std::env::var("POTATODB_ARROW_WAL_SYNC_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let arrow_wal_scratch_bytes = std::env::var("POTATODB_ARROW_WAL_SCRATCH_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+
+        let arrow_wal_sync_policy = match arrow_wal_sync.as_str() {
+            "never" | "none" | "off" => potatodb_wal::ArrowWalSyncPolicy::Never,
+            "always" => potatodb_wal::ArrowWalSyncPolicy::Always,
+            "every_n" | "everyn" => potatodb_wal::ArrowWalSyncPolicy::EveryNAppends(
+                arrow_wal_sync_every_n.unwrap_or(10),
+            ),
+            "every_ms" | "everyms" | "interval" => potatodb_wal::ArrowWalSyncPolicy::EveryInterval(
+                Duration::from_millis(arrow_wal_sync_ms.unwrap_or(10)),
+            ),
+            _ => {
+                if let Some(n) = arrow_wal_sync_every_n {
+                    potatodb_wal::ArrowWalSyncPolicy::EveryNAppends(n)
+                } else if let Some(ms) = arrow_wal_sync_ms {
+                    potatodb_wal::ArrowWalSyncPolicy::EveryInterval(Duration::from_millis(ms))
+                } else {
+                    potatodb_wal::ArrowWalSyncPolicy::Always
+                }
+            }
+        };
+
+        let arrow_wal_cfg = potatodb_wal::ArrowWalConfig {
+            sync_policy: arrow_wal_sync_policy,
+            scratch_capacity_bytes: arrow_wal_scratch_bytes,
+        };
+
+        let arrow_wal = Some(ArrowWal::open_with_config(&arrow_wal_dir, arrow_wal_cfg)?);
 
         let slow_query_threshold_ms = std::env::var("POTATODB_SLOW_QUERY_MS")
             .ok()
