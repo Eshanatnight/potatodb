@@ -47,8 +47,14 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Cargo test (workspace, all targets)
-        run: cargo test --workspace --all-targets --locked
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Test (workspace, all targets)
+        run: make test
+
+      - name: FFI and Python tests
+        run: make ffi-test python-test
 
   fmt:
     name: Rustfmt (format check)
@@ -88,5 +94,5 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run clippy lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: make clippy
 
