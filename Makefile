@@ -1,6 +1,6 @@
-.PHONY: all help build check clippy clippy-fix fmt fmt-check clean test \
+.PHONY: all help build check clippy-full clippy-base clippy clippy-fix fmt fmt-check clean test \
        rust-test bench bench-html release run run-repl run-release doc ffi ffi-example ffi-test \
-       python-test package
+       python-test package perftest perf-save perf-compare
 
 all: fmt clippy test build
 
@@ -33,6 +33,10 @@ help:
 	@echo "  ffi-example     Build C++ FFI example binary"
 	@echo "  ffi-test        Build and run C++ FFI unit tests (doctest)"
 	@echo "  python-test     Build and run Python binding tests (uv + pytest)"
+	@echo "  perftest        Run performance test suite (release mode)"
+	@echo "  perf-save       Run perf test and save baseline to PERF_BASELINE"
+	@echo "  perf-compare    Run perf test and compare against PERF_BASELINE"
+	@echo "                  Tune with PERF_SCALE=N PERF_ITERS=N PERF_BASELINE=file.json"
 	@echo "  package         Create a .tar.gz package in dist/"
 	@echo "                  Override with PACKAGE_DIR/PACKAGE_NAME/PACKAGE_VERSION/PACKAGE_FILE"
 	@echo "                  and set PYTHON='py -3' on Windows if needed"
@@ -60,10 +64,15 @@ check:
 
 # ── Quality ──────────────────────────────────────────────────
 
-clippy:
+clippy-base:
+	cargo clippy --workspace --all-targets -- -D warnings
+
+clippy-full:
 	cargo clippy --workspace -- -W clippy::pedantic -W clippy::nursery \
 		-W clippy::correctness -W clippy::complexity \
 		-W clippy::perf -W clippy::style -W clippy::all -D warnings
+
+clippy: clippy-base clippy-full
 
 clippy-fix:
 	cargo clippy --workspace --fix --allow-dirty -- -W clippy::all -W clippy::correctness \
@@ -86,6 +95,21 @@ bench:
 bench-html: bench
 	@echo "Benchmark HTML report:"
 	@echo "  target/criterion/report/index.html"
+
+PERF_BASELINE ?= perf_baseline.json
+PERF_SCALE ?= 1
+PERF_ITERS ?= 5
+
+perftest:
+	cargo run --release --example perftest -- --scale $(PERF_SCALE) --iterations $(PERF_ITERS)
+
+perf-save:
+	cargo run --release --example perftest -- --scale $(PERF_SCALE) --iterations $(PERF_ITERS) \
+		--save $(PERF_BASELINE)
+
+perf-compare:
+	cargo run --release --example perftest -- --scale $(PERF_SCALE) --iterations $(PERF_ITERS) \
+		--baseline $(PERF_BASELINE)
 
 # ── Run ──────────────────────────────────────────────────────
 

@@ -504,6 +504,7 @@ struct App {
     query_area: Rect,
     history_file: Option<PathBuf>,
     completion: Option<Completion>,
+    show_timing: bool,
 }
 
 const HISTORY_MAX: usize = 1000;
@@ -556,6 +557,7 @@ impl App {
             query_area: Rect::default(),
             history_file,
             completion: None,
+            show_timing: false,
         }
     }
 
@@ -1108,6 +1110,15 @@ impl App {
         let trimmed = cmd.trim();
 
         let sql_translation = match trimmed {
+            "\\timing" => {
+                self.show_timing = !self.show_timing;
+                let msg = format!("Timing is {}.", if self.show_timing { "on" } else { "off" });
+                self.set_toast(msg.clone());
+                self.results = QueryResults::from_message(msg);
+                self.status = "OK".into();
+                self.elapsed = format_elapsed(start.elapsed());
+                return;
+            }
             "\\dt" => Some(
                 "SELECT table_name FROM information_schema.tables \
                  WHERE table_schema = 'public' ORDER BY table_name"
@@ -1189,7 +1200,11 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, h)| {
-                let max_data = rows.iter().map(|r| r.get(i).map_or(0, String::len)).max().unwrap_or(0);
+                let max_data = rows
+                    .iter()
+                    .map(|r| r.get(i).map_or(0, String::len))
+                    .max()
+                    .unwrap_or(0);
                 h.len().max(max_data) as u16
             })
             .collect();
@@ -1223,7 +1238,7 @@ impl App {
                 let count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                 self.results = QueryResults::from_batches(&batches);
                 self.status = format!("{count} rows");
-                self.elapsed = format_elapsed(start.elapsed());
+                self.elapsed = self.format_timing(db, start.elapsed());
                 self.table_state = TableState::default();
                 if count > 0 {
                     self.table_state.select(Some(0));
@@ -1231,18 +1246,36 @@ impl App {
             }
             Ok(QueryResult::Message(msg)) => {
                 self.status.clone_from(&msg);
-                self.elapsed = format_elapsed(start.elapsed());
+                self.elapsed = self.format_timing(db, start.elapsed());
                 self.set_toast(msg.clone());
                 self.results = QueryResults::from_message(msg);
             }
             Err(e) => {
                 self.results = QueryResults::from_error(&e.to_string());
                 self.status = "Query failed".into();
-                self.elapsed = format_elapsed(start.elapsed());
+                self.elapsed = self.format_timing(db, start.elapsed());
             }
         }
         self.h_scroll = 0;
         self.load_tables(db).await;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn format_timing(&self, db: &PotatoDB, d: Duration) -> String {
+        if !self.show_timing {
+            return format_elapsed(d);
+        }
+        let ms = d.as_secs_f64() * 1000.0;
+        let metrics = db.last_query_metrics();
+        if metrics.parquet_files_read > 0 || metrics.bytes_scanned > 0 {
+            let kb = metrics.bytes_scanned as f64 / 1024.0;
+            format!(
+                "{ms:.3} ms | files: {} | scanned: {kb:.1} KB",
+                metrics.parquet_files_read,
+            )
+        } else {
+            format!("{ms:.3} ms")
+        }
     }
 
     async fn load_tables(&mut self, db: &mut PotatoDB) {

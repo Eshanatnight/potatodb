@@ -7,3 +7,5 @@ potatodb_data/
 .potatodb_history
 .idea/
 **/*/__pycache__/
+potatodb_sample*.txt
+potatodb_profile_data/

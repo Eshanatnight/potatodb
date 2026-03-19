@@ -48,6 +48,8 @@ use arrow::{csv, json};
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::Column;
 use datafusion::common::{
     stats::Precision, ColumnStatistics as DfColumnStatistics, ScalarValue,
     Statistics as DfStatistics,
@@ -58,7 +60,10 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{
+    Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
+};
+use datafusion::optimizer::OptimizerRule;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -67,7 +72,7 @@ use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::ObjectStore;
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType,
     ExactNumberInfo, MergeAction, MergeClauseKind, MergeInsertKind, ObjectType, OnConflict,
@@ -78,6 +83,10 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use url::Url;
 
+mod checkpoint_policy;
+mod sql_helpers;
+
+use checkpoint_policy::should_checkpoint_autocommit;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -87,6 +96,9 @@ use potatodb_catalog::{
     TableStatistics, TriggerDef, UdfDef, ViewDef,
 };
 use potatodb_wal::{ArrowWal, EntryStatus, Wal, WalEntry};
+use sql_helpers::{
+    is_read_only_sql, normalize_explain_sql, parse_as_of_timestamp, strip_as_of_timestamp,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -114,6 +126,9 @@ pub struct S3Config {
     pub region: Option<String>,
     /// Whether to allow plain HTTP (non-TLS) connections.
     pub allow_http: bool,
+    /// Local directory for WAL file when using S3 storage.
+    /// Defaults to `./potatodb_s3_wal` when not specified.
+    pub wal_dir: Option<String>,
 }
 
 /// A prepared statement stored for later execution with parameters.
@@ -256,6 +271,96 @@ impl TableProvider for StatsAwareTableProvider {
     }
 }
 
+/// Splits Projection nodes that contain more than one scalar subquery into
+/// nested Projections with at most one each.  This prevents `DataFusion`'s
+/// `scalar_subquery_to_join` rule from producing duplicate `__always_true`
+/// columns that cause an "Ambiguous reference" error.
+#[derive(Debug)]
+struct SplitScalarSubqueries;
+
+impl OptimizerRule for SplitScalarSubqueries {
+    fn name(&self) -> &'static str {
+        "split_scalar_subqueries"
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn apply_order(&self) -> Option<datafusion::optimizer::optimizer::ApplyOrder> {
+        Some(datafusion::optimizer::optimizer::ApplyOrder::TopDown)
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn datafusion::optimizer::OptimizerConfig,
+    ) -> datafusion::common::Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Projection(ref proj) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let sq_indices: Vec<usize> = proj
+            .expr
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.exists(|inner| Ok(matches!(inner, Expr::ScalarSubquery(_))))
+                    .unwrap_or(false)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if sq_indices.len() <= 1 {
+            return Ok(Transformed::no(plan));
+        }
+
+        let input = proj.input.as_ref().clone();
+        let first_sq_idx = sq_indices[0];
+        let first_sq_expr = proj.expr[first_sq_idx].clone();
+
+        let sq_alias = format!("__potato_sq_{first_sq_idx}");
+
+        let (base_expr, orig_alias) = match first_sq_expr {
+            Expr::Alias(ref a) => (a.expr.as_ref().clone(), Some(a.name.clone())),
+            _ => (first_sq_expr, None),
+        };
+
+        let mut inner_exprs: Vec<Expr> = input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::from)
+            .collect();
+        inner_exprs.push(base_expr.alias(&sq_alias));
+
+        let inner_plan = LogicalPlanBuilder::from(input)
+            .project(inner_exprs)?
+            .build()?;
+
+        let col_ref = Expr::Column(Column::new_unqualified(&sq_alias));
+        let outer_ref = match orig_alias {
+            Some(name) => col_ref.alias(name),
+            None => col_ref,
+        };
+
+        let mut outer_exprs = Vec::with_capacity(proj.expr.len());
+        for (i, expr) in proj.expr.iter().enumerate() {
+            if i == first_sq_idx {
+                outer_exprs.push(outer_ref.clone());
+            } else {
+                outer_exprs.push(expr.clone());
+            }
+        }
+
+        let new_plan = LogicalPlanBuilder::from(inner_plan)
+            .project(outer_exprs)?
+            .build()?;
+
+        Ok(Transformed::yes(new_plan))
+    }
+}
+
 /// State for an in-flight explicit transaction started with `BEGIN`.
 struct Transaction {
     /// Catalog state captured at `BEGIN` for rollback.
@@ -326,6 +431,14 @@ pub struct PotatoDB {
     max_query_log_entries: usize,
     /// WAL size threshold for periodic autocommit checkpoints.
     wal_checkpoint_threshold_bytes: u64,
+    /// Additional checkpoint trigger by committed autocommit operations.
+    wal_checkpoint_every_commits: u64,
+    /// Additional checkpoint trigger by elapsed time since last checkpoint.
+    wal_checkpoint_interval: Duration,
+    /// Number of autocommit writes since the last WAL checkpoint.
+    wal_commits_since_checkpoint: u64,
+    /// Instant when the last WAL checkpoint finished.
+    last_wal_checkpoint_at: Instant,
     /// Per-table in-memory buffered INSERT data.
     write_buffer: HashMap<String, BufferedInsert>,
     /// Flush threshold by buffered row count.
@@ -340,6 +453,10 @@ pub struct PotatoDB {
     rows_since_analyze: HashMap<String, usize>,
     /// Threshold that triggers automatic ANALYZE.
     auto_analyze_threshold_rows: usize,
+    /// Tables that have hit the auto-analyze threshold but haven't been
+    /// analyzed yet.  Drained lazily at the start of the next `execute`
+    /// call so that INSERT / COPY / UPSERT callers are not blocked.
+    pending_analyze_tables: Vec<String>,
     /// Logical-plan cache for repeated read-only SQL text.
     plan_cache: HashMap<String, LogicalPlan>,
     /// Number of times a cached plan was reused (plan cache hits).
@@ -360,8 +477,6 @@ pub struct PotatoDB {
     /// snapshotting every table after every mutation when the feature
     /// is unused.
     snapshots_enabled: bool,
-    s3_wal_path: Option<ObjPath>,
-    s3_wal_entries: Vec<WalEntry>,
     /// When a table accumulates more Parquet files than this, an
     /// automatic compaction (similar to VACUUM) is triggered after
     /// flush.  Set to 0 to disable.
@@ -421,8 +536,8 @@ fn parse_parquet_compression(s: &str) -> parquet::basic::Compression {
 /// Builds a [`SessionConfig`] tuned for Parquet performance.
 ///
 /// Key settings can be overridden via environment variables:
-/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 8192)
-/// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 8192)
+/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 32768)
+/// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 16384)
 /// - `POTATODB_TARGET_PARTITIONS` — Number of parallel partitions (default: CPU cores)
 /// - `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` — Enforce batch size in hash joins (default: true)
 /// - `POTATODB_COALESCE_BATCHES` — Coalesce small batches between operators (default: true)
@@ -439,7 +554,7 @@ fn build_session_config() -> SessionConfig {
     let batch_size = std::env::var("POTATODB_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16384);
+        .unwrap_or(32768);
 
     let write_batch_size = std::env::var("POTATODB_PARQUET_WRITE_BATCH_SIZE")
         .ok()
@@ -470,6 +585,8 @@ fn build_session_config() -> SessionConfig {
         .with_target_partitions(parallelism)
         .with_enforce_batch_size_in_joins(enforce_batch_size_in_joins)
         .with_coalesce_batches(coalesce_batches);
+
+    config.options_mut().optimizer.skip_failed_rules = true;
 
     let parquet = &mut config.options_mut().execution.parquet;
 
@@ -506,6 +623,7 @@ impl PotatoDB {
     pub async fn new(data_url: String, s3_config: Option<S3Config>) -> Result<Self, BoxError> {
         let config = build_session_config();
         let ctx = SessionContext::new_with_config(config);
+        ctx.add_optimizer_rule(Arc::new(SplitScalarSubqueries));
 
         // Ensure generate_series table function is available (PostgreSQL-compatible)
         let gs = datafusion::functions_table::generate_series();
@@ -579,34 +697,63 @@ impl PotatoDB {
 
         let mut catalog = Catalog::load(store.clone(), catalog_obj_path).await?;
 
-        let (wal, arrow_wal, replay_entries, s3_wal_path, s3_wal_entries) = if is_s3 {
-            let path = if s3_prefix.is_empty() {
-                ObjPath::from("_wal/entries.json")
-            } else {
-                ObjPath::from(format!("{s3_prefix}/_wal/entries.json"))
-            };
-            let loaded_entries = match store.get(&path).await {
-                Ok(result) => {
-                    let bytes = result.bytes().await?;
-                    let s = String::from_utf8_lossy(&bytes);
-                    s.lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .filter_map(|l| serde_json::from_str::<WalEntry>(l).ok())
-                        .collect()
-                }
-                Err(object_store::Error::NotFound { .. }) => Vec::new(),
-                Err(e) => return Err(e.into()),
-            };
-            let replay = recover_wal_entries(&loaded_entries);
-            (None, None, replay, Some(path), loaded_entries)
+        let wal_base_dir = if is_s3 {
+            let dir = s3_config
+                .as_ref()
+                .and_then(|c| c.wal_dir.clone())
+                .unwrap_or_else(|| ".potatodb_s3_wal".to_string());
+            PathBuf::from(dir)
         } else {
-            let wal_path = PathBuf::from(&data_url_normalized).join("wal.log");
-            let replay = Wal::recover(&wal_path)?;
-            let wal = Some(Wal::open(&wal_path)?);
-            let arrow_wal_dir = PathBuf::from(&data_url_normalized).join("_arrow_wal");
-            let awal = Some(ArrowWal::open(&arrow_wal_dir)?);
-            (wal, awal, replay, None, Vec::new())
+            PathBuf::from(&data_url_normalized)
         };
+
+        std::fs::create_dir_all(&wal_base_dir)?;
+
+        let wal_path = wal_base_dir.join("wal.log");
+        let replay_entries = Wal::recover(&wal_path)?;
+        let wal = Some(Wal::open(&wal_path)?);
+        let arrow_wal_dir = wal_base_dir.join("_arrow_wal");
+        let arrow_wal_sync = std::env::var("POTATODB_ARROW_WAL_SYNC")
+            .ok()
+            .unwrap_or_else(|| "always".to_string())
+            .to_ascii_lowercase();
+        let arrow_wal_sync_every_n = std::env::var("POTATODB_ARROW_WAL_SYNC_EVERY_N")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let arrow_wal_sync_ms = std::env::var("POTATODB_ARROW_WAL_SYNC_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let arrow_wal_scratch_bytes = std::env::var("POTATODB_ARROW_WAL_SCRATCH_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+
+        let arrow_wal_sync_policy = match arrow_wal_sync.as_str() {
+            "never" | "none" | "off" => potatodb_wal::ArrowWalSyncPolicy::Never,
+            "always" => potatodb_wal::ArrowWalSyncPolicy::Always,
+            "every_n" | "everyn" => potatodb_wal::ArrowWalSyncPolicy::EveryNAppends(
+                arrow_wal_sync_every_n.unwrap_or(10),
+            ),
+            "every_ms" | "everyms" | "interval" => potatodb_wal::ArrowWalSyncPolicy::EveryInterval(
+                Duration::from_millis(arrow_wal_sync_ms.unwrap_or(10)),
+            ),
+            _ => {
+                if let Some(n) = arrow_wal_sync_every_n {
+                    potatodb_wal::ArrowWalSyncPolicy::EveryNAppends(n)
+                } else if let Some(ms) = arrow_wal_sync_ms {
+                    potatodb_wal::ArrowWalSyncPolicy::EveryInterval(Duration::from_millis(ms))
+                } else {
+                    potatodb_wal::ArrowWalSyncPolicy::Always
+                }
+            }
+        };
+
+        let arrow_wal_cfg = potatodb_wal::ArrowWalConfig {
+            sync_policy: arrow_wal_sync_policy,
+            scratch_capacity_bytes: arrow_wal_scratch_bytes,
+        };
+
+        let arrow_wal = Some(ArrowWal::open_with_config(&arrow_wal_dir, arrow_wal_cfg)?);
 
         let slow_query_threshold_ms = std::env::var("POTATODB_SLOW_QUERY_MS")
             .ok()
@@ -620,6 +767,14 @@ impl PotatoDB {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(4 * 1024 * 1024 * 1024);
+        let wal_checkpoint_every_commits = std::env::var("POTATODB_WAL_CHECKPOINT_COMMITS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let wal_checkpoint_interval = std::env::var("POTATODB_WAL_CHECKPOINT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(Duration::from_secs(0), Duration::from_millis);
         let write_buffer_row_threshold = std::env::var("POTATODB_WRITE_BUFFER_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -691,6 +846,10 @@ impl PotatoDB {
             slow_query_threshold_ms,
             max_query_log_entries,
             wal_checkpoint_threshold_bytes,
+            wal_checkpoint_every_commits,
+            wal_checkpoint_interval,
+            wal_commits_since_checkpoint: 0,
+            last_wal_checkpoint_at: Instant::now(),
             write_buffer: HashMap::new(),
             write_buffer_row_threshold,
             write_buffer_byte_threshold,
@@ -698,6 +857,7 @@ impl PotatoDB {
             temp_table_counter: 0,
             rows_since_analyze: HashMap::new(),
             auto_analyze_threshold_rows,
+            pending_analyze_tables: Vec::new(),
             plan_cache: HashMap::new(),
             plan_cache_hits: 0,
             procedures: HashMap::new(),
@@ -711,8 +871,6 @@ impl PotatoDB {
             snapshots: VecDeque::new(),
             snapshot_retention_ms,
             snapshots_enabled: false,
-            s3_wal_path,
-            s3_wal_entries,
             auto_compact_file_threshold: 20,
             last_query_metrics: QueryMetrics::default(),
             replicas: Vec::new(),
@@ -737,8 +895,8 @@ impl PotatoDB {
         }
         let _ = db.capture_snapshot().await;
 
-        if !is_s3 {
-            let arrow_wal_dir = PathBuf::from(&db.data_url).join("_arrow_wal");
+        {
+            let arrow_wal_dir = wal_base_dir.join("_arrow_wal");
             let recovered_batches = ArrowWal::recover(&arrow_wal_dir)?;
             if !recovered_batches.is_empty() {
                 db.replaying_wal = true;
@@ -829,12 +987,8 @@ impl PotatoDB {
             .users
             .keys()
             .map(|u| {
-                let roles: Vec<String> = self
-                    .catalog
-                    .user_roles
-                    .get(u)
-                    .cloned()
-                    .unwrap_or_default();
+                let roles: Vec<String> =
+                    self.catalog.user_roles.get(u).cloned().unwrap_or_default();
                 (u.clone(), roles)
             })
             .collect()
@@ -842,7 +996,7 @@ impl PotatoDB {
 
     /// Returns the I/O metrics from the last executed query.
     #[must_use]
-    pub fn last_query_metrics(&self) -> &QueryMetrics {
+    pub const fn last_query_metrics(&self) -> &QueryMetrics {
         &self.last_query_metrics
     }
 
@@ -860,8 +1014,7 @@ impl PotatoDB {
         self.catalog
             .tables
             .get(table)
-            .map(|m| m.deletion_vectors.len())
-            .unwrap_or(0)
+            .map_or(0, |m| m.deletion_vectors.len())
     }
 
     #[must_use]
@@ -1014,22 +1167,12 @@ impl PotatoDB {
             return Ok(());
         }
         let txn_id = self.current_wal_txn_id();
-        if self.is_s3 {
-            self.s3_wal_entries.push(WalEntry {
-                txn_id,
-                status: EntryStatus::Pending,
-                sql: sql.to_string(),
-            });
-            // Replication: would forward WAL entry to self.replicas here
-            return Ok(());
-        }
         if let Some(wal) = self.wal.as_mut() {
             wal.append_no_sync(&WalEntry {
                 txn_id,
                 status: EntryStatus::Pending,
                 sql: sql.to_string(),
             })?;
-            // Replication: would forward WAL entry to self.replicas here
         }
         Ok(())
     }
@@ -1038,22 +1181,20 @@ impl PotatoDB {
         if self.replaying_wal || self.in_transaction() {
             return Ok(());
         }
-        // Replication: would forward committed WAL to self.replicas here
-        if self.is_s3 {
-            self.s3_wal_entries.push(WalEntry {
-                txn_id: 0,
-                status: EntryStatus::Committed,
-                sql: String::new(),
-            });
-            if force_checkpoint {
-                self.s3_wal_entries.clear();
-            }
-            return Ok(());
-        }
         if let Some(wal) = self.wal.as_mut() {
             wal.commit_no_checkpoint(0)?;
-            if force_checkpoint {
+            self.wal_commits_since_checkpoint = self.wal_commits_since_checkpoint.saturating_add(1);
+            let elapsed = self.last_wal_checkpoint_at.elapsed();
+            if should_checkpoint_autocommit(
+                force_checkpoint,
+                self.wal_commits_since_checkpoint,
+                self.wal_checkpoint_every_commits,
+                elapsed,
+                self.wal_checkpoint_interval,
+            ) {
                 wal.checkpoint()?;
+                self.wal_commits_since_checkpoint = 0;
+                self.last_wal_checkpoint_at = Instant::now();
             } else {
                 wal.maybe_checkpoint(self.wal_checkpoint_threshold_bytes)?;
             }
@@ -1061,21 +1202,21 @@ impl PotatoDB {
         Ok(())
     }
 
-    async fn persist_s3_wal(&self) -> Result<(), BoxError> {
-        if !self.is_s3 {
-            return Ok(());
+    fn handle_checkpoint(&mut self) -> Result<QueryResult, BoxError> {
+        if self.in_transaction() {
+            return Err("CHECKPOINT is not allowed in an explicit transaction".into());
         }
-        let Some(path) = &self.s3_wal_path else {
-            return Ok(());
-        };
-        let mut lines = String::new();
-        for entry in &self.s3_wal_entries {
-            lines.push_str(&serde_json::to_string(entry)?);
-            lines.push('\n');
+        if let Some(wal) = self.wal.as_mut() {
+            wal.checkpoint()?;
+            self.wal_commits_since_checkpoint = 0;
+            self.last_wal_checkpoint_at = Instant::now();
         }
-        let payload = PutPayload::from_bytes(lines.into_bytes().into());
-        self.store.put(path, payload).await?;
-        Ok(())
+        if let Some(awal) = self.arrow_wal.as_mut() {
+            awal.checkpoint_all()?;
+        }
+        Ok(QueryResult::Message(
+            "Checkpoint completed for WAL and Arrow WAL.".to_string(),
+        ))
     }
 
     fn next_temp_table_name(&mut self, tag: &str) -> String {
@@ -1192,11 +1333,11 @@ impl PotatoDB {
         let _ = self.ctx.deregister_table(&tmp_name);
         write_result?;
 
-        if let Some(ref awal) = self.arrow_wal {
+        if let Some(ref mut awal) = self.arrow_wal {
             awal.checkpoint_table(table_name)?;
         }
 
-        self.maybe_auto_analyze(table_name, row_count).await?;
+        self.maybe_auto_analyze(table_name, row_count);
         self.refresh_table_file_stats_light(table_name).await?;
         self.maybe_auto_compact(table_name).await?;
 
@@ -1276,13 +1417,9 @@ impl PotatoDB {
         Ok(total)
     }
 
-    async fn maybe_auto_analyze(
-        &mut self,
-        table_name: &str,
-        rows_written: usize,
-    ) -> Result<(), BoxError> {
+    fn maybe_auto_analyze(&mut self, table_name: &str, rows_written: usize) {
         if rows_written == 0 || self.auto_analyze_threshold_rows == 0 {
-            return Ok(());
+            return;
         }
         let entry = self
             .rows_since_analyze
@@ -1291,9 +1428,18 @@ impl PotatoDB {
         *entry = entry.saturating_add(rows_written);
         if *entry >= self.auto_analyze_threshold_rows {
             *entry = 0;
-            let _ = self.handle_analyze(table_name).await?;
+            self.pending_analyze_tables.push(table_name.to_string());
         }
-        Ok(())
+    }
+
+    async fn drain_pending_analyze(&mut self) {
+        if self.pending_analyze_tables.is_empty() {
+            return;
+        }
+        let tables = std::mem::take(&mut self.pending_analyze_tables);
+        for table in tables {
+            let _ = self.handle_analyze(&table).await;
+        }
     }
 
     async fn expand_nextval_calls(&mut self, sql: &str) -> Result<String, BoxError> {
@@ -1395,9 +1541,9 @@ impl PotatoDB {
         Ok(())
     }
 
-    /// Rebuilds all inverted indexes from fulltext_indexes metadata and table data.
+    /// Rebuilds all inverted indexes from `fulltext_indexes` metadata and table data.
     async fn rebuild_fts_indexes(&mut self) -> Result<(), BoxError> {
-        for (idx_name, def) in self.fulltext_indexes.clone().iter() {
+        for (idx_name, def) in &self.fulltext_indexes.clone() {
             let table_name = &def.table_name;
             let columns = &def.columns;
             let cols_sql = columns
@@ -1583,8 +1729,12 @@ impl PotatoDB {
         Ok(())
     }
 
-    /// Reads all data from a table, deletes its Parquet files,
-    /// re-registers it, and writes the given batches back.
+    /// Replaces a table's Parquet files with the given `batches`.
+    ///
+    /// Before touching any files, a full in-memory snapshot of the current
+    /// table data is captured.  If the write of new data fails (e.g. disk
+    /// full, schema mismatch), the snapshot is written back so no data is
+    /// lost.
     ///
     /// This is the core "copy-on-write rewrite" used by `DELETE`,
     /// `UPDATE`, `VACUUM`, and `CREATE INDEX`.
@@ -1600,6 +1750,18 @@ impl PotatoDB {
             .get(table_name)
             .ok_or_else(|| format!("Table '{table_name}' does not exist"))?
             .clone();
+
+        let original_batches: Vec<RecordBatch> = self
+            .ctx
+            .sql(&format!("SELECT * FROM \"{table_name}\""))
+            .await?
+            .collect()
+            .await?;
+        let original_schema = if original_batches.is_empty() {
+            None
+        } else {
+            Some(original_batches[0].schema())
+        };
 
         self.ctx.deregister_table(table_name)?;
         self.delete_parquet_files(table_name).await?;
@@ -1618,22 +1780,77 @@ impl PotatoDB {
 
         let has_data = !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0);
         if has_data {
-            let mem = MemTable::try_new(schema, vec![batches])?;
-            self.ctx
-                .register_table("__potato_rewrite_tmp", Arc::new(mem))?;
-            self.ctx
-                .sql(&format!(
-                    "INSERT INTO \"{table_name}\" SELECT * FROM __potato_rewrite_tmp"
-                ))
-                .await?
-                .collect()
-                .await?;
-            self.ctx.deregister_table("__potato_rewrite_tmp")?;
+            let prep = MemTable::try_new(schema, vec![batches]).and_then(|mem| {
+                self.ctx
+                    .register_table("__potato_rewrite_tmp", Arc::new(mem))?;
+                Ok(())
+            });
+
+            let write_result: Result<(), BoxError> = if let Err(e) = prep {
+                Err(e.into())
+            } else {
+                let r = match self
+                    .ctx
+                    .sql(&format!(
+                        "INSERT INTO \"{table_name}\" SELECT * FROM __potato_rewrite_tmp"
+                    ))
+                    .await
+                {
+                    Ok(df) => df.collect().await,
+                    Err(e) => Err(e),
+                };
+                let _ = self.ctx.deregister_table("__potato_rewrite_tmp");
+                r.map(|_| ()).map_err(Into::into)
+            };
+
+            if let Err(e) = write_result {
+                self.restore_table_from_snapshot(table_name, original_schema, original_batches)
+                    .await;
+                return Err(e);
+            }
         }
 
         self.refresh_table_file_stats_light(table_name).await?;
 
         Ok(())
+    }
+
+    /// Best-effort restore of table data from an in-memory snapshot.
+    async fn restore_table_from_snapshot(
+        &self,
+        table_name: &str,
+        original_schema: Option<SchemaRef>,
+        original_batches: Vec<RecordBatch>,
+    ) {
+        let Some(schema) = original_schema else {
+            return;
+        };
+        let has_orig =
+            !original_batches.is_empty() && original_batches.iter().any(|b| b.num_rows() > 0);
+        if !has_orig {
+            return;
+        }
+        let Ok(mem) = MemTable::try_new(schema, vec![original_batches]) else {
+            return;
+        };
+        if self
+            .ctx
+            .register_table("__potato_restore_tmp", Arc::new(mem))
+            .is_err()
+        {
+            return;
+        }
+        let _ = async {
+            self.ctx
+                .sql(&format!(
+                    "INSERT INTO \"{table_name}\" SELECT * FROM __potato_restore_tmp"
+                ))
+                .await?
+                .collect()
+                .await
+        }
+        .await;
+        let _ = self.ctx.deregister_table("__potato_restore_tmp");
     }
 
     /// Captures a full-table backup before a destructive rewrite in a txn.
@@ -1698,15 +1915,7 @@ impl PotatoDB {
         }
 
         if !self.replaying_wal {
-            if self.is_s3 {
-                self.s3_wal_entries.push(WalEntry {
-                    txn_id: txn.wal_txn_id,
-                    status: EntryStatus::Committed,
-                    sql: String::new(),
-                });
-                self.s3_wal_entries.clear();
-                self.persist_s3_wal().await?;
-            } else if let Some(wal) = self.wal.as_mut() {
+            if let Some(wal) = self.wal.as_mut() {
                 wal.commit(txn.wal_txn_id)?;
                 wal.checkpoint()?;
             }
@@ -1765,15 +1974,7 @@ impl PotatoDB {
         }
 
         if !self.replaying_wal {
-            if self.is_s3 {
-                self.s3_wal_entries.push(WalEntry {
-                    txn_id: txn.wal_txn_id,
-                    status: EntryStatus::Aborted,
-                    sql: String::new(),
-                });
-                self.s3_wal_entries.clear();
-                self.persist_s3_wal().await?;
-            } else if let Some(wal) = self.wal.as_mut() {
+            if let Some(wal) = self.wal.as_mut() {
                 wal.abort(txn.wal_txn_id)?;
                 wal.checkpoint()?;
             }
@@ -1889,11 +2090,13 @@ impl PotatoDB {
         txn.file_snapshot = file_snapshot;
         txn.rewrite_backups = HashMap::new();
 
-        Ok(QueryResult::Message(format!("ROLLBACK TO SAVEPOINT {name}")))
+        Ok(QueryResult::Message(format!(
+            "ROLLBACK TO SAVEPOINT {name}"
+        )))
     }
 
     /// `RELEASE [SAVEPOINT] name` -- discards the named savepoint without restoring.
-    async fn handle_release_savepoint(&mut self, name: &str) -> Result<QueryResult, BoxError> {
+    fn handle_release_savepoint(&mut self, name: &str) -> Result<QueryResult, BoxError> {
         let txn = self
             .active_txn
             .as_mut()
@@ -1943,6 +2146,37 @@ impl PotatoDB {
         Ok(results)
     }
 
+    /// Executes statements from a SQL file and invokes `on_result` after each statement.
+    ///
+    /// This allows callers to stream output (e.g. printing each statement's
+    /// result immediately) instead of waiting for full-file completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL file cannot be read.
+    pub async fn execute_file_with_callback<F>(
+        &mut self,
+        path: &str,
+        continue_on_error: bool,
+        mut on_result: F,
+    ) -> Result<(), BoxError>
+    where
+        F: FnMut(&str, &Result<QueryResult, BoxError>),
+    {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read SQL file '{path}': {e}"))?;
+        let statements = split_sql_statements(&contents);
+        for stmt in statements {
+            let result = self.execute(&stmt).await;
+            let is_err = result.is_err();
+            on_result(&stmt, &result);
+            if is_err && !continue_on_error {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // ── SQL dispatch ───────────────────────────────────────────
 
     /// Parses and executes a single SQL statement.
@@ -1955,6 +2189,7 @@ impl PotatoDB {
     /// Returns an error if the SQL is invalid or execution fails.
     #[async_recursion::async_recursion]
     pub async fn execute(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
+        self.drain_pending_analyze().await;
         self.last_query_metrics = QueryMetrics::default();
         let started_at = Instant::now();
         let mut effective_sql = self.expand_nextval_calls(sql).await?;
@@ -2023,6 +2258,10 @@ impl PotatoDB {
 
         if upper.starts_with("SELECT ") && upper.contains("FROM POTATODB_CDC") {
             let result = self.handle_select_cdc(trimmed);
+            return self.finalize_query(sql, started_at, result);
+        }
+        if upper.starts_with("SELECT ") && upper.contains("FROM POTATODB_SYSTEM_STATUS") {
+            let result = self.handle_select_system_status();
             return self.finalize_query(sql, started_at, result);
         }
 
@@ -2125,11 +2364,13 @@ impl PotatoDB {
         }
         if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
             let name = if upper.starts_with("RELEASE SAVEPOINT ") {
-                trimmed["RELEASE SAVEPOINT ".len()..].trim().trim_matches('"')
+                trimmed["RELEASE SAVEPOINT ".len()..]
+                    .trim()
+                    .trim_matches('"')
             } else {
                 trimmed["RELEASE ".len()..].trim().trim_matches('"')
             };
-            let result = self.handle_release_savepoint(name).await;
+            let result = self.handle_release_savepoint(name);
             return self.finalize_query(sql, started_at, result);
         }
         if upper.starts_with("CREATE MIGRATION ") {
@@ -2195,6 +2436,11 @@ impl PotatoDB {
             self.catalog.flush_if_dirty().await?;
             return self.finalize_query(sql, started_at, result);
         }
+        if upper == "CHECKPOINT" || upper == "CHECKPOINT;" {
+            let result = self.handle_checkpoint();
+            self.catalog.flush_if_dirty().await?;
+            return self.finalize_query(sql, started_at, result);
+        }
 
         let dialect = PostgreSqlDialect {};
         let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
@@ -2203,12 +2449,9 @@ impl PotatoDB {
                 let (table_name, do_analyze) = if parts.len() >= 3
                     && parts.get(1).map(|s| s.to_uppercase()) == Some("ANALYZE".into())
                 {
-                    (
-                        parts.get(2).map(|s| s.trim_matches('"')).unwrap_or(""),
-                        true,
-                    )
+                    (parts.get(2).map_or("", |s| s.trim_matches('"')), true)
                 } else if parts.len() >= 2 {
-                    (parts.get(1).map(|s| s.trim_matches('"')).unwrap_or(""), false)
+                    (parts.get(1).map_or("", |s| s.trim_matches('"')), false)
                 } else {
                     return self.finalize_query(
                         sql,
@@ -2454,7 +2697,6 @@ impl PotatoDB {
             let mutated_table = extract_mutated_table(&statements[0]);
             self.evict_plan_cache(mutated_table.as_deref());
             self.wal_finish_autocommit(force_wal_checkpoint)?;
-            self.persist_s3_wal().await?;
             if self.snapshots_enabled {
                 let _ = self.capture_snapshot().await;
             }
@@ -2630,7 +2872,6 @@ impl PotatoDB {
 
     async fn collect_with_plan_cache(&mut self, sql: &str) -> Result<Vec<RecordBatch>, BoxError> {
         if is_read_only_sql(sql) {
-            // Partition awareness: log when query touches partitioned tables
             for table_name in extract_table_names_from_readonly_sql(sql) {
                 if let Some(meta) = self.catalog.tables.get(&table_name) {
                     if !meta.partition_columns.is_empty() {
@@ -2652,14 +2893,37 @@ impl PotatoDB {
                 }
                 self.plan_cache.remove(sql);
             }
-            let df = self.ctx.sql(sql).await?;
-            let plan = df.logical_plan().clone();
-            let batches = df.collect().await?;
-            self.plan_cache.insert(sql.to_string(), plan);
-            return Ok(batches);
+            match self.ctx.sql(sql).await {
+                Ok(df) => {
+                    let plan = df.logical_plan().clone();
+                    let batches = df.collect().await?;
+                    self.plan_cache.insert(sql.to_string(), plan);
+                    return Ok(batches);
+                }
+                Err(e) if e.to_string().contains("coerce types Duration") => {
+                    if let Some(rewritten) = rewrite_date_subtraction_sql(sql) {
+                        let df = self.ctx.sql(&rewritten).await?;
+                        let plan = df.logical_plan().clone();
+                        let batches = df.collect().await?;
+                        self.plan_cache.insert(sql.to_string(), plan);
+                        return Ok(batches);
+                    }
+                    return Err(e.into());
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        let df = self.ctx.sql(sql).await?;
-        Ok(df.collect().await?)
+        match self.ctx.sql(sql).await {
+            Ok(df) => Ok(df.collect().await?),
+            Err(e) if e.to_string().contains("coerce types Duration") => {
+                if let Some(rewritten) = rewrite_date_subtraction_sql(sql) {
+                    let df = self.ctx.sql(&rewritten).await?;
+                    return Ok(df.collect().await?);
+                }
+                Err(e.into())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn capture_snapshot(&mut self) -> Result<(), BoxError> {
@@ -2764,7 +3028,7 @@ impl PotatoDB {
                     "timestamp_ms": timestamp_ms,
                     "rows": rows
                 });
-                let _ = writeln!(f, "{}", line);
+                let _ = writeln!(f, "{line}");
             }
         }
     }
@@ -2793,10 +3057,10 @@ impl PotatoDB {
         for rn in role_names {
             if let Some(role_def) = self.catalog.roles.get(rn) {
                 for priv_entry in &role_def.privileges {
-                    if priv_entry.kind == "ALL" || priv_entry.kind == action {
-                        if priv_entry.table.is_none() || priv_entry.table.as_deref() == table {
-                            return true;
-                        }
+                    if (priv_entry.kind == "ALL" || priv_entry.kind == action)
+                        && (priv_entry.table.is_none() || priv_entry.table.as_deref() == table)
+                    {
+                        return true;
                     }
                 }
             }
@@ -2877,6 +3141,43 @@ impl PotatoDB {
         Ok(QueryResult::Records(vec![batch]))
     }
 
+    #[allow(clippy::cast_possible_wrap)]
+    fn handle_select_system_status(&self) -> Result<QueryResult, BoxError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("plan_cache_entries", DataType::Int64, false),
+            Field::new("plan_cache_hits", DataType::Int64, false),
+            Field::new("query_log_entries", DataType::Int64, false),
+            Field::new("snapshots", DataType::Int64, false),
+            Field::new("wal_commits_since_checkpoint", DataType::Int64, false),
+            Field::new("wal_checkpoint_threshold_bytes", DataType::Int64, false),
+            Field::new("last_query_parquet_files_read", DataType::Int64, false),
+            Field::new("last_query_bytes_scanned", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![self.plan_cache.len() as i64])),
+                Arc::new(Int64Array::from(vec![self.plan_cache_hits as i64])),
+                Arc::new(Int64Array::from(vec![self.query_log.len() as i64])),
+                Arc::new(Int64Array::from(vec![self.snapshots.len() as i64])),
+                Arc::new(Int64Array::from(vec![
+                    self.wal_commits_since_checkpoint as i64,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.wal_checkpoint_threshold_bytes as i64,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.last_query_metrics.parquet_files_read as i64,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    self.last_query_metrics.bytes_scanned as i64,
+                ])),
+            ],
+        )?;
+        Ok(QueryResult::Records(vec![batch]))
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
     fn handle_pg_catalog_query(&self, sql: &str) -> Result<QueryResult, BoxError> {
         let upper = sql.to_uppercase();
         if upper.contains("PG_TYPE") {
@@ -2887,16 +3188,18 @@ impl PotatoDB {
             ]));
             let oid_arr = Int32Array::from(vec![23, 1043, 16, 701, 25, 1114, 1082]);
             let name_arr = StringArray::from(vec![
-                "int4", "varchar", "bool", "float8", "text", "timestamp", "date",
+                "int4",
+                "varchar",
+                "bool",
+                "float8",
+                "text",
+                "timestamp",
+                "date",
             ]);
             let len_arr = Int16Array::from(vec![4, -1, 1, 8, -1, 8, 4]);
             let batch = RecordBatch::try_new(
                 schema,
-                vec![
-                    Arc::new(oid_arr),
-                    Arc::new(name_arr),
-                    Arc::new(len_arr),
-                ],
+                vec![Arc::new(oid_arr), Arc::new(name_arr), Arc::new(len_arr)],
             )?;
             return Ok(QueryResult::Records(vec![batch]));
         }
@@ -2909,8 +3212,7 @@ impl PotatoDB {
             let oids: Vec<i32> = (1..=table_names.len() as i32).collect();
             let oid_arr = Int32Array::from(oids);
             let name_arr = StringArray::from(table_names);
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(oid_arr), Arc::new(name_arr)])?;
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(oid_arr), Arc::new(name_arr)])?;
             return Ok(QueryResult::Records(vec![batch]));
         }
         if upper.contains("PG_NAMESPACE") {
@@ -2920,8 +3222,7 @@ impl PotatoDB {
             ]));
             let oid_arr = Int32Array::from(vec![2200]);
             let name_arr = StringArray::from(vec!["public"]);
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(oid_arr), Arc::new(name_arr)])?;
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(oid_arr), Arc::new(name_arr)])?;
             return Ok(QueryResult::Records(vec![batch]));
         }
         if upper.contains("PG_ATTRIBUTE") {
@@ -2930,7 +3231,7 @@ impl PotatoDB {
             let mut attnums = Vec::new();
             let mut atttypids = Vec::new();
             let mut rel_oid: i32 = 1;
-            for (_table_name, meta) in &self.catalog.tables {
+            for meta in self.catalog.tables.values() {
                 for (idx, col) in meta.columns.iter().enumerate() {
                     attrelids.push(rel_oid);
                     attnames.push(col.name.clone());
@@ -3046,8 +3347,7 @@ impl PotatoDB {
         let after_event = &after_timing[event.len()..];
         let on_idx = find_ci(after_event, " ON ").ok_or("CREATE TRIGGER requires ON")?;
         let table_part = after_event[on_idx + 4..].trim();
-        let exec_idx =
-            find_ci(table_part, " EXECUTE ").ok_or("CREATE TRIGGER requires EXECUTE")?;
+        let exec_idx = find_ci(table_part, " EXECUTE ").ok_or("CREATE TRIGGER requires EXECUTE")?;
         let table = table_part[..exec_idx].trim().trim_matches('"').to_string();
         let body =
             extract_dollar_quoted_body(trimmed).ok_or("CREATE TRIGGER requires $$...$$ body")?;
@@ -3166,7 +3466,7 @@ impl PotatoDB {
             // Execute statements with variable substitution.
             // Process vars by descending name length so "myvar" is replaced before "var".
             let mut var_order: Vec<_> = vars.keys().collect();
-            var_order.sort_by(|a, b| b.len().cmp(&a.len()));
+            var_order.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
             for stmt in split_sql_statements(exec_section) {
                 let mut resolved = stmt.clone();
@@ -3288,11 +3588,7 @@ impl PotatoDB {
     fn handle_add_replica(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         // ADD REPLICA 'url' or ADD REPLICA "url"
         let rest = sql["ADD REPLICA ".len()..].trim().trim_end_matches(';');
-        let url = rest
-            .trim()
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string();
+        let url = rest.trim().trim_matches('\'').trim_matches('"').to_string();
         if url.is_empty() {
             return Err("ADD REPLICA requires a URL".into());
         }
@@ -3304,11 +3600,7 @@ impl PotatoDB {
 
     fn handle_remove_replica(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         let rest = sql["REMOVE REPLICA ".len()..].trim().trim_end_matches(';');
-        let url = rest
-            .trim()
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string();
+        let url = rest.trim().trim_matches('\'').trim_matches('"').to_string();
         if url.is_empty() {
             return Err("REMOVE REPLICA requires a URL".into());
         }
@@ -3320,13 +3612,19 @@ impl PotatoDB {
 
     async fn handle_create_migration(&mut self, sql: &str) -> Result<QueryResult, BoxError> {
         // CREATE MIGRATION <version> <description> AS $$ sql $$
-        let rest = sql["CREATE MIGRATION ".len()..].trim().trim_end_matches(';');
+        let rest = sql["CREATE MIGRATION ".len()..]
+            .trim()
+            .trim_end_matches(';');
         let mut tokens = rest.splitn(2, |c: char| c.is_ascii_whitespace());
-        let version_str = tokens.next().ok_or("CREATE MIGRATION requires a version number")?;
+        let version_str = tokens
+            .next()
+            .ok_or("CREATE MIGRATION requires a version number")?;
         let version: u64 = version_str
             .parse()
             .map_err(|_| "CREATE MIGRATION version must be a non-negative integer")?;
-        let after_version = tokens.next().ok_or("CREATE MIGRATION requires description and AS $$ sql $$")?;
+        let after_version = tokens
+            .next()
+            .ok_or("CREATE MIGRATION requires description and AS $$ sql $$")?;
         let as_delim = "AS $$";
         let upper_rest = after_version.to_uppercase();
         let as_idx = upper_rest
@@ -3394,7 +3692,12 @@ impl PotatoDB {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64;
-            if let Some(rec) = self.catalog.migrations.iter_mut().find(|r| r.version == m.version) {
+            if let Some(rec) = self
+                .catalog
+                .migrations
+                .iter_mut()
+                .find(|r| r.version == m.version)
+            {
                 rec.applied_at_ms = now_ms;
             }
             self.catalog.schema_version = m.version;
@@ -3417,12 +3720,13 @@ impl PotatoDB {
             return Err("CREATE ROLE requires a name".into());
         }
         let role = tokens[2].trim_matches('"').to_string();
-        self.catalog.roles.entry(role.clone()).or_insert_with(|| {
-            potatodb_catalog::RoleDef {
+        self.catalog
+            .roles
+            .entry(role.clone())
+            .or_insert_with(|| potatodb_catalog::RoleDef {
                 name: role.clone(),
                 privileges: Vec::new(),
-            }
-        });
+            });
         self.catalog.save().await?;
         Ok(QueryResult::Message(format!("Role '{role}' created.")))
     }
@@ -3466,14 +3770,12 @@ impl PotatoDB {
                 user_role_list.push(role_name);
             }
         } else {
-            let role_def = self
-                .catalog
-                .roles
-                .entry(target.clone())
-                .or_insert_with(|| potatodb_catalog::RoleDef {
+            let role_def = self.catalog.roles.entry(target.clone()).or_insert_with(|| {
+                potatodb_catalog::RoleDef {
                     name: target.clone(),
                     privileges: Vec::new(),
-                });
+                }
+            });
             if !role_def.privileges.contains(&priv_entry) {
                 role_def.privileges.push(priv_entry);
             }
@@ -4047,9 +4349,7 @@ impl PotatoDB {
             .catalog
             .triggers
             .values()
-            .filter(|t| {
-                t.table == table_name && t.event == "DELETE" && t.timing == "BEFORE"
-            })
+            .filter(|t| t.table == table_name && t.event == "DELETE" && t.timing == "BEFORE")
             .map(|t| t.body.clone())
             .collect();
         for body in before_triggers {
@@ -4202,8 +4502,13 @@ impl PotatoDB {
         };
 
         let df = self.ctx.sql(&select_sql).await?;
-        let schema = Arc::new(df.schema().as_arrow().clone());
+        let logical_schema = Arc::new(df.schema().as_arrow().clone());
         let surviving = df.collect().await?;
+        let schema = if surviving.is_empty() {
+            logical_schema
+        } else {
+            surviving[0].schema()
+        };
         let new_count: usize = surviving
             .iter()
             .map(arrow::array::RecordBatch::num_rows)
@@ -4220,9 +4525,7 @@ impl PotatoDB {
             .catalog
             .triggers
             .values()
-            .filter(|t| {
-                t.table == table_name && t.event == "DELETE" && t.timing == "AFTER"
-            })
+            .filter(|t| t.table == table_name && t.event == "DELETE" && t.timing == "AFTER")
             .map(|t| t.body.clone())
             .collect();
         for body in after_triggers {
@@ -4252,9 +4555,7 @@ impl PotatoDB {
             .catalog
             .triggers
             .values()
-            .filter(|t| {
-                t.table == table_name && t.event == "UPDATE" && t.timing == "BEFORE"
-            })
+            .filter(|t| t.table == table_name && t.event == "UPDATE" && t.timing == "BEFORE")
             .map(|t| t.body.clone())
             .collect();
         for body in before_triggers {
@@ -4304,8 +4605,9 @@ impl PotatoDB {
                     t.trim_matches('"') == target_name
                 }) {
                     format!(
-                        "CASE WHEN ({where_expr}) THEN ({val}) ELSE \"{col}\" END AS \"{col}\"",
+                        "CASE WHEN ({where_expr}) THEN CAST(({val}) AS {ty}) ELSE \"{col}\" END AS \"{col}\"",
                         val = assignment.value,
+                        ty = c.data_type,
                         col = target_name
                     )
                 } else {
@@ -4317,8 +4619,13 @@ impl PotatoDB {
         let rewrite_sql = format!("SELECT {} FROM \"{table_name}\"", projections.join(", "));
 
         let df = self.ctx.sql(&rewrite_sql).await?;
-        let schema = Arc::new(df.schema().as_arrow().clone());
+        let logical_schema = Arc::new(df.schema().as_arrow().clone());
         let modified = df.collect().await?;
+        let schema = if modified.is_empty() {
+            logical_schema
+        } else {
+            modified[0].schema()
+        };
 
         self.rewrite_table(&table_name, schema, modified).await?;
         if let Some(meta) = self.catalog.tables.get_mut(&table_name) {
@@ -4339,7 +4646,10 @@ impl PotatoDB {
     }
 
     /// Handles `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...`.
-    /// Delegates to UPDATE and INSERT by building equivalent SQL and calling execute().
+    ///
+    /// Materialises the USING source into a temporary `__merge_src` table,
+    /// then directly computes the merged result using `ctx.sql()` + LEFT JOIN
+    /// (bypassing `execute()` so the temp table stays visible to `DataFusion`).
     async fn handle_merge(
         &mut self,
         table: &TableFactor,
@@ -4347,111 +4657,250 @@ impl PotatoDB {
         on: &sqlparser::ast::Expr,
         clauses: &[sqlparser::ast::MergeClause],
     ) -> Result<QueryResult, BoxError> {
-        let target_str = table.to_string();
-        let source_str = source.to_string();
-        let on_str = on.to_string();
+        let (target_name, target_alias) = match table {
+            TableFactor::Table { name, alias, .. } => {
+                let n = name.to_string().trim_matches('"').to_string();
+                let a = alias.as_ref().map(|a| a.name.value.clone());
+                (n, a)
+            }
+            _ => return Err("MERGE target must be a table".into()),
+        };
 
-        if !matches!(table, TableFactor::Table { .. }) {
-            return Err("MERGE target must be a table".into());
+        let table_meta = self
+            .catalog
+            .tables
+            .get(&target_name)
+            .ok_or_else(|| format!("Table '{target_name}' does not exist"))?
+            .clone();
+
+        let _ = self.flush_all().await?;
+
+        let (source_sql, source_alias, source_table_name) = match source {
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => (
+                subquery.to_string(),
+                alias.as_ref().map(|a| a.name.value.clone()),
+                None,
+            ),
+            TableFactor::Table { name, alias, .. } => {
+                let sn = name.to_string().trim_matches('"').to_string();
+                (
+                    format!("SELECT * FROM {name}"),
+                    alias.as_ref().map(|a| a.name.value.clone()),
+                    Some(sn),
+                )
+            }
+            _ => return Err("Unsupported MERGE source type".into()),
+        };
+
+        let rewrite = |s: &str| -> String {
+            let mut r = s.to_string();
+            if let Some(ref a) = target_alias {
+                r = r.replace(&format!("{a}."), &format!("\"{target_name}\"."));
+            }
+            if let Some(ref a) = source_alias {
+                r = r.replace(&format!("{a}."), "\"__merge_src\".");
+            } else if let Some(ref sn) = source_table_name {
+                r = r.replace(&format!("{sn}."), "\"__merge_src\".");
+            }
+            r
+        };
+
+        let src_df = self.ctx.sql(&source_sql).await?;
+        let src_batches = src_df.collect().await?;
+        if src_batches.is_empty() || src_batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(QueryResult::Message(
+                "0 row(s) updated, 0 row(s) inserted.".into(),
+            ));
         }
+        let src_schema = src_batches[0].schema();
+        let mem_table = MemTable::try_new(src_schema, vec![src_batches])?;
+        self.ctx
+            .register_table("__merge_src", Arc::new(mem_table))?;
+
+        let on_str = rewrite(&on.to_string());
 
         let mut total_updated = 0_i64;
         let mut total_inserted = 0_i64;
 
-        for clause in clauses {
-            let predicate_str = clause
-                .predicate
-                .as_ref()
-                .map(|p| format!(" AND ({})", p))
-                .unwrap_or_default();
+        let inner: Result<(), BoxError> = async {
+            for clause in clauses {
+                let predicate_str = clause
+                    .predicate
+                    .as_ref()
+                    .map(|p| format!(" AND ({})", rewrite(&p.to_string())))
+                    .unwrap_or_default();
 
-            match (&clause.clause_kind, &clause.action) {
-                (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                    let set_parts: Vec<String> = assignments
-                        .iter()
-                        .map(|a| format!("{} = {}", a.target, a.value))
-                        .collect();
-                    let set_clause = set_parts.join(", ");
-                    let update_sql = format!(
-                        "UPDATE {} SET {} FROM {} WHERE ({}){predicate_str}",
-                        target_str, set_clause, source_str, on_str
-                    );
-                    let result = self.execute(&update_sql).await?;
-                    if let QueryResult::Message(msg) = result {
-                        if let Some(n) = msg.split_whitespace().next().and_then(|s| s.parse::<i64>().ok()) {
-                            total_updated += n;
+                match (&clause.clause_kind, &clause.action) {
+                    (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
+                        let mut update_map: HashMap<String, String> = HashMap::new();
+                        for a in assignments {
+                            let col = a.target.to_string().trim_matches('"').to_string();
+                            let val = rewrite(&a.value.to_string());
+                            update_map.insert(col, val);
+                        }
+
+                        let projections: Vec<String> = table_meta
+                            .columns
+                            .iter()
+                            .map(|c| {
+                                if let Some(val) = update_map.get(&c.name) {
+                                    format!(
+                                        "CASE WHEN \"__merge_src_match\" IS NOT NULL \
+                                         THEN CAST({val} AS {}) \
+                                         ELSE \"{target_name}\".\"{col}\" \
+                                         END AS \"{col}\"",
+                                        c.data_type,
+                                        col = c.name
+                                    )
+                                } else {
+                                    format!("\"{target_name}\".\"{}\"", c.name)
+                                }
+                            })
+                            .collect();
+
+                        let count_sql = format!(
+                            "SELECT COUNT(*) AS c \
+                             FROM \"{target_name}\" \
+                             INNER JOIN \"__merge_src\" ON ({on_str}){predicate_str}"
+                        );
+                        let count_batches = self.ctx.sql(&count_sql).await?.collect().await?;
+                        total_updated = count_batches
+                            .iter()
+                            .find_map(|b| {
+                                b.column(0)
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .map(|a| a.value(0))
+                            })
+                            .unwrap_or(0);
+
+                        if total_updated > 0 {
+                            let rewrite_sql = format!(
+                                "SELECT {proj} \
+                                 FROM \"{target_name}\" \
+                                 LEFT JOIN (\
+                                     SELECT *, TRUE AS \"__merge_src_match\" \
+                                     FROM \"__merge_src\"\
+                                 ) AS \"__merge_src\" ON ({on_str}){predicate_str}",
+                                proj = projections.join(", ")
+                            );
+                            let df = self.ctx.sql(&rewrite_sql).await?;
+                            let logical_schema = Arc::new(df.schema().as_arrow().clone());
+                            let batches = df.collect().await?;
+                            let schema = if batches.is_empty() {
+                                logical_schema
+                            } else {
+                                batches[0].schema()
+                            };
+                            self.rewrite_table(&target_name, schema, batches).await?;
                         }
                     }
-                }
-                (MergeClauseKind::Matched, MergeAction::Delete) => {
-                    let delete_sql = format!(
-                        "DELETE FROM {} WHERE EXISTS (SELECT 1 FROM {} WHERE ({})){predicate_str}",
-                        target_str, source_str, on_str
-                    );
-                    let _ = self.execute(&delete_sql).await?;
-                }
-                (MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget, MergeAction::Insert(insert_expr)) => {
-                    let (cols, select_list) = match &insert_expr.kind {
-                        MergeInsertKind::Row => {
-                            let cols = if insert_expr.columns.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    " ({})",
-                                    insert_expr
-                                        .columns
-                                        .iter()
-                                        .map(|c| c.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )
-                            };
-                            (cols, "*".to_string())
-                        }
-                        MergeInsertKind::Values(values) => {
-                            let cols = if insert_expr.columns.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    " ({})",
-                                    insert_expr
-                                        .columns
-                                        .iter()
-                                        .map(|c| c.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )
-                            };
-                            let select_list = values
-                                .rows
-                                .first()
-                                .map(|row| {
-                                    row.iter()
-                                        .map(|e| e.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_else(|| "*".to_string());
-                            (cols, select_list)
-                        }
-                    };
-                    let insert_sql = format!(
-                        "INSERT INTO {target_str}{cols} SELECT {select_list} FROM {source_str} WHERE NOT EXISTS (SELECT 1 FROM {target_str} WHERE {on_str}){predicate_str}"
-                    );
-                    let result = self.execute(&insert_sql).await?;
-                    if let QueryResult::Message(msg) = result {
-                        if let Some(n) = msg.split_whitespace().next().and_then(|s| s.parse::<i64>().ok()) {
-                            total_inserted += n;
-                        }
+                    (MergeClauseKind::Matched, MergeAction::Delete) => {
+                        let keep_sql = format!(
+                            "SELECT \"{target_name}\".* \
+                             FROM \"{target_name}\" \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM \"__merge_src\" \
+                                 WHERE ({on_str}){predicate_str}\
+                             )"
+                        );
+                        let df = self.ctx.sql(&keep_sql).await?;
+                        let logical_schema = Arc::new(df.schema().as_arrow().clone());
+                        let batches = df.collect().await?;
+                        let schema = if batches.is_empty() {
+                            logical_schema
+                        } else {
+                            batches[0].schema()
+                        };
+                        self.rewrite_table(&target_name, schema, batches).await?;
                     }
+                    (
+                        MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
+                        MergeAction::Insert(insert_expr),
+                    ) => {
+                        let (cols, select_list) = match &insert_expr.kind {
+                            MergeInsertKind::Row => {
+                                let cols = if insert_expr.columns.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " ({})",
+                                        insert_expr
+                                            .columns
+                                            .iter()
+                                            .map(std::string::ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                };
+                                (cols, "*".to_string())
+                            }
+                            MergeInsertKind::Values(values) => {
+                                let cols = if insert_expr.columns.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " ({})",
+                                        insert_expr
+                                            .columns
+                                            .iter()
+                                            .map(std::string::ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )
+                                };
+                                let select_list = values.rows.first().map_or_else(
+                                    || "*".to_string(),
+                                    |row| {
+                                        row.iter()
+                                            .map(|v| rewrite(&v.to_string()))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    },
+                                );
+                                (cols, select_list)
+                            }
+                        };
+                        let insert_sql = format!(
+                            "INSERT INTO \"{target_name}\"{cols} \
+                             SELECT {select_list} FROM \"__merge_src\" \
+                             WHERE NOT EXISTS (\
+                                 SELECT 1 FROM \"{target_name}\" \
+                                 WHERE ({on_str})\
+                             ){predicate_str}"
+                        );
+                        let insert_batches = self.ctx.sql(&insert_sql).await?.collect().await?;
+                        total_inserted = insert_batches
+                            .iter()
+                            .find_map(|b| {
+                                b.column(0)
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::UInt64Array>()
+                                    .map(|a| a.value(0).cast_signed())
+                            })
+                            .unwrap_or(0);
+                        self.refresh_table_file_stats_light(&target_name).await?;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            Ok(())
         }
+        .await;
+
+        let _ = self.ctx.deregister_table("__merge_src");
+        inner?;
+
+        self.record_cdc_event(
+            &target_name,
+            "MERGE",
+            (total_updated + total_inserted) as usize,
+        );
 
         Ok(QueryResult::Message(format!(
-            "{} row(s) updated, {} row(s) inserted.",
-            total_updated, total_inserted
+            "{total_updated} row(s) updated, {total_inserted} row(s) inserted."
         )))
     }
 
@@ -4772,9 +5221,7 @@ impl PotatoDB {
             .catalog
             .triggers
             .values()
-            .filter(|t| {
-                t.table == table_name && t.event == "INSERT" && t.timing == "BEFORE"
-            })
+            .filter(|t| t.table == table_name && t.event == "INSERT" && t.timing == "BEFORE")
             .map(|t| t.body.clone())
             .collect();
         for body in before_triggers {
@@ -4839,8 +5286,7 @@ impl PotatoDB {
                                 .downcast_ref::<Int64Array>()
                                 .map(|a| a.value(0) as usize)
                         })
-                        .map(|total| total.saturating_sub(inserted_rows))
-                        .unwrap_or(0),
+                        .map_or(0, |total| total.saturating_sub(inserted_rows)),
                     Err(_) => 0,
                 };
                 for (idx_name, def) in &self.fulltext_indexes.clone() {
@@ -4856,7 +5302,9 @@ impl PotatoDB {
                                     let s = target_columns
                                         .iter()
                                         .position(|c| c == col_name)
-                                        .map(|i| array_value_to_string(batch.column(i).as_ref(), row))
+                                        .map(|i| {
+                                            array_value_to_string(batch.column(i).as_ref(), row)
+                                        })
                                         .unwrap_or_default();
                                     text_parts.push(s);
                                 }
@@ -4871,7 +5319,7 @@ impl PotatoDB {
 
             self.validate_constraints_batch(&table_name, &target_columns, &batches)
                 .await?;
-            self.maybe_auto_analyze(&table_name, inserted_rows).await?;
+            self.maybe_auto_analyze(&table_name, inserted_rows);
             self.refresh_table_file_stats_light(&table_name).await?;
             self.record_cdc_event(&table_name, "INSERT", inserted_rows);
 
@@ -4879,9 +5327,7 @@ impl PotatoDB {
                 .catalog
                 .triggers
                 .values()
-                .filter(|t| {
-                    t.table == table_name && t.event == "INSERT" && t.timing == "AFTER"
-                })
+                .filter(|t| t.table == table_name && t.event == "INSERT" && t.timing == "AFTER")
                 .map(|t| t.body.clone())
                 .collect();
             for body in after_triggers {
@@ -4919,9 +5365,7 @@ impl PotatoDB {
             .catalog
             .triggers
             .values()
-            .filter(|t| {
-                t.table == table_name && t.event == "INSERT" && t.timing == "AFTER"
-            })
+            .filter(|t| t.table == table_name && t.event == "INSERT" && t.timing == "AFTER")
             .map(|t| t.body.clone())
             .collect();
         for body in after_triggers {
@@ -5176,8 +5620,7 @@ impl PotatoDB {
         self.validate_not_null_table(&table_name).await?;
         self.validate_table_constraints(&table_name).await?;
         self.validate_check_constraints(&table_name).await?;
-        self.maybe_auto_analyze(&table_name, inserted.saturating_add(updated))
-            .await?;
+        self.maybe_auto_analyze(&table_name, inserted.saturating_add(updated));
         self.refresh_table_file_stats_light(&table_name).await?;
         self.record_cdc_event(&table_name, "UPSERT", inserted.saturating_add(updated));
 
@@ -5265,14 +5708,14 @@ impl PotatoDB {
             .flatten()
             .sum();
 
-        let mut col_stats = HashMap::new();
+        let mut col_stats = HashMap::with_capacity(table_meta.columns.len());
 
         for col_def in &table_meta.columns {
             let col_name = &col_def.name;
             let stats_sql = format!(
                 "SELECT \
                      COUNT(*) - COUNT(\"{col_name}\") AS null_count, \
-                     COUNT(DISTINCT \"{col_name}\") AS distinct_count, \
+                     APPROX_DISTINCT(\"{col_name}\") AS distinct_count, \
                      CAST(MIN(\"{col_name}\") AS VARCHAR) AS min_val, \
                      CAST(MAX(\"{col_name}\") AS VARCHAR) AS max_val \
                  FROM \"{table_name}\""
@@ -5289,8 +5732,8 @@ impl PotatoDB {
                 let distinct_count = batch
                     .column(1)
                     .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .map(|a| a.value(0) as u64);
+                    .downcast_ref::<UInt64Array>()
+                    .map(|a| a.value(0));
                 let min_value = batch
                     .column(2)
                     .as_any()
@@ -5437,6 +5880,8 @@ impl PotatoDB {
             .iter()
             .map(arrow::array::RecordBatch::num_rows)
             .sum();
+        let mut missing_target_cols = 0usize;
+        let mut source_only_cols = 0usize;
 
         if total_rows > 0 {
             let schema = batches[0].schema();
@@ -5465,11 +5910,16 @@ impl PotatoDB {
                     if source_fields.contains(col_name) {
                         format!("\"{col_name}\"")
                     } else {
+                        missing_target_cols = missing_target_cols.saturating_add(1);
                         format!("NULL AS \"{col_name}\"")
                     }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            source_only_cols = source_fields
+                .iter()
+                .filter(|name| !target_cols.iter().any(|c| c == *name))
+                .count();
             let target_col_list = target_cols
                 .iter()
                 .map(|c| format!("\"{c}\""))
@@ -5488,12 +5938,12 @@ impl PotatoDB {
         self.validate_not_null_table(table_name).await?;
         self.validate_table_constraints(table_name).await?;
         self.validate_check_constraints(table_name).await?;
-        self.maybe_auto_analyze(table_name, total_rows).await?;
+        self.maybe_auto_analyze(table_name, total_rows);
         self.refresh_table_file_stats(table_name).await?;
         self.record_cdc_event(table_name, "COPY_FROM", total_rows);
 
         Ok(QueryResult::Message(format!(
-            "{total_rows} row(s) copied into '{table_name}'."
+            "{total_rows} row(s) copied into '{table_name}' from '{file_path}' ({format}); missing target columns filled with NULL: {missing_target_cols}, source-only columns ignored: {source_only_cols}."
         )))
     }
 
@@ -6160,7 +6610,10 @@ fn extract_mutated_table(stmt: &Statement) -> Option<String> {
     match stmt {
         Statement::Insert(ins) => Some(ins.table.to_string()),
         Statement::Update { table, .. } => Some(table.relation.to_string()),
-        Statement::Merge { table, .. } => Some(table.to_string()),
+        Statement::Merge { table, .. } => match table {
+            TableFactor::Table { name, .. } => Some(name.to_string().trim_matches('"').to_string()),
+            _ => Some(table.to_string()),
+        },
         Statement::Delete(del) => match &del.from {
             sqlparser::ast::FromTable::WithFromKeyword(tables)
             | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
@@ -6208,14 +6661,6 @@ fn substitute_parameters(template: &str, params: &[sqlparser::ast::Expr]) -> Str
         i += 1;
     }
     result
-}
-
-fn is_read_only_sql(sql: &str) -> bool {
-    let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
-    matches!(
-        first.as_str(),
-        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "EXPLAIN"
-    )
 }
 
 /// Extracts base table names from a read-only SQL string (SELECT, WITH, etc.).
@@ -6280,13 +6725,14 @@ fn extract_tables_from_table_factor(factor: &TableFactor, out: &mut Vec<String>)
         TableFactor::Derived { subquery, .. } => {
             extract_tables_from_set_expr(&subquery.body, out);
         }
-        TableFactor::NestedJoin { table_with_joins, .. } => {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
             extract_tables_from_table_with_joins(table_with_joins, out);
         }
-        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
-            extract_tables_from_table_factor(table, out);
-        }
-        TableFactor::MatchRecognize { table, .. } => {
+        TableFactor::Pivot { table, .. }
+        | TableFactor::Unpivot { table, .. }
+        | TableFactor::MatchRecognize { table, .. } => {
             extract_tables_from_table_factor(table, out);
         }
         TableFactor::TableFunction { .. }
@@ -6588,7 +7034,7 @@ fn find_ci(haystack: &str, needle_upper: &str) -> Option<usize> {
 }
 
 /// Replaces whole-word variable references in SQL for PL/pgSQL variable substitution.
-/// Matches var_name only when it appears as a standalone identifier (not part of another).
+/// Matches `var_name` only when it appears as a standalone identifier (not part of another).
 fn substitute_plpgsql_var(sql: &str, var_name: &str, value: &str) -> String {
     if var_name.is_empty() {
         return sql.to_string();
@@ -6601,8 +7047,8 @@ fn substitute_plpgsql_var(sql: &str, var_name: &str, value: &str) -> String {
     while i < sql.len() {
         if i + len <= sql.len() && sql_lower[i..i + len] == var_lower {
             let prev_ok = i == 0 || !is_plpgsql_identifier_char(sql.as_bytes()[i - 1]);
-            let next_ok = i + len >= sql.len()
-                || !is_plpgsql_identifier_char(sql.as_bytes()[i + len]);
+            let next_ok =
+                i + len >= sql.len() || !is_plpgsql_identifier_char(sql.as_bytes()[i + len]);
             if prev_ok && next_ok {
                 result.push_str(value);
                 i += len;
@@ -6615,7 +7061,7 @@ fn substitute_plpgsql_var(sql: &str, var_name: &str, value: &str) -> String {
     result
 }
 
-fn is_plpgsql_identifier_char(b: u8) -> bool {
+const fn is_plpgsql_identifier_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
@@ -6624,6 +7070,166 @@ fn extract_dollar_quoted_body(sql: &str) -> Option<String> {
     let tail = &sql[start + 2..];
     let end = tail.find("$$")?;
     Some(tail[..end].to_string())
+}
+
+/// Rewrites subtraction expressions in SELECT items so that Date−Date
+/// arithmetic produces an integer (days) instead of a Duration.
+///
+/// Called as a fallback when `DataFusion`'s type-coercion rejects
+/// `Duration BETWEEN Int`.  Each `a - b` in a SELECT-item position is
+/// replaced with `CAST(date_part('epoch', (a - b)) / 86400 AS BIGINT)`.
+/// If the subtraction was numeric the retry will fail harmlessly and the
+/// original error is returned to the caller.
+fn rewrite_date_subtraction_sql(sql: &str) -> Option<String> {
+    use sqlparser::ast::{
+        BinaryOperator, CastKind, DataType as SqlDT, Expr as SqlE, FunctionArg, FunctionArgExpr,
+        FunctionArguments, ObjectNamePart, Query, SelectItem, SetExpr,
+    };
+
+    fn rewrite_expr(e: &mut SqlE) {
+        match e {
+            SqlE::BinaryOp {
+                op: BinaryOperator::Minus,
+                ..
+            } => {
+                let original = e.clone();
+                let epoch_lit =
+                    SqlE::Value(sqlparser::ast::Value::SingleQuotedString("epoch".into()).into());
+                let date_part_fn = SqlE::Function(sqlparser::ast::Function {
+                    name: sqlparser::ast::ObjectName(vec![ObjectNamePart::Identifier(
+                        sqlparser::ast::Ident::new("date_part"),
+                    )]),
+                    uses_odbc_syntax: false,
+                    parameters: FunctionArguments::None,
+                    args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args: vec![
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(epoch_lit)),
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlE::Nested(Box::new(
+                                original,
+                            )))),
+                        ],
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: vec![],
+                });
+                let divided = SqlE::BinaryOp {
+                    left: Box::new(date_part_fn),
+                    op: BinaryOperator::Divide,
+                    right: Box::new(SqlE::Value(
+                        sqlparser::ast::Value::Number("86400".into(), false).into(),
+                    )),
+                };
+                *e = SqlE::Cast {
+                    expr: Box::new(SqlE::Nested(Box::new(divided))),
+                    data_type: SqlDT::BigInt(None),
+                    format: None,
+                    kind: CastKind::Cast,
+                };
+            }
+            _ => {
+                visit_expr_children_mut(e, rewrite_expr);
+            }
+        }
+    }
+
+    fn visit_expr_children_mut(e: &mut SqlE, f: fn(&mut SqlE)) {
+        match e {
+            SqlE::Nested(inner) | SqlE::UnaryOp { expr: inner, .. } => f(inner),
+            SqlE::BinaryOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            SqlE::Cast { expr, .. } => f(expr),
+            SqlE::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(o) = operand {
+                    f(o);
+                }
+                for cw in conditions {
+                    f(&mut cw.condition);
+                    f(&mut cw.result);
+                }
+                if let Some(el) = else_result {
+                    f(el);
+                }
+            }
+            SqlE::Between {
+                expr, low, high, ..
+            } => {
+                f(expr);
+                f(low);
+                f(high);
+            }
+            SqlE::Function(func) => {
+                if let FunctionArguments::List(ref mut list) = func.args {
+                    for arg in &mut list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(ex))
+                            | FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(ex),
+                                ..
+                            } => f(ex),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            SqlE::Subquery(q) => rewrite_query(q),
+            _ => {}
+        }
+    }
+
+    fn rewrite_select_items(items: &mut [SelectItem]) {
+        for item in items {
+            match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    rewrite_expr(e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite_set_expr(se: &mut SetExpr) {
+        match se {
+            SetExpr::Select(sel) => rewrite_select_items(&mut sel.projection),
+            SetExpr::Query(q) => rewrite_query(q),
+            SetExpr::SetOperation { left, right, .. } => {
+                rewrite_set_expr(left);
+                rewrite_set_expr(right);
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_query(q: &mut Query) {
+        for cte in q.with.iter_mut().flat_map(|w| w.cte_tables.iter_mut()) {
+            rewrite_query(&mut cte.query);
+        }
+        rewrite_set_expr(&mut q.body);
+    }
+
+    let dialect = PostgreSqlDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    let stmt = stmts.first_mut()?;
+    match stmt {
+        Statement::Query(q) => rewrite_query(q),
+        Statement::Explain { statement, .. } => {
+            if let Statement::Query(q) = statement.as_mut() {
+                rewrite_query(q);
+            }
+        }
+        _ => return None,
+    }
+    Some(stmts[0].to_string())
 }
 
 fn rewrite_fulltext_match_sql(sql: &str, fulltext: &HashMap<String, FulltextIndexDef>) -> String {
@@ -6930,38 +7536,6 @@ fn resolve_conflict_columns(
     Ok(Vec::new())
 }
 
-fn recover_wal_entries(entries: &[WalEntry]) -> Vec<WalEntry> {
-    let mut committed = HashSet::new();
-    let mut aborted = HashSet::new();
-    for e in entries {
-        if e.txn_id == 0 {
-            continue;
-        }
-        match e.status {
-            EntryStatus::Committed => {
-                committed.insert(e.txn_id);
-            }
-            EntryStatus::Aborted => {
-                aborted.insert(e.txn_id);
-            }
-            EntryStatus::Pending => {}
-        }
-    }
-    entries
-        .iter()
-        .filter(|e| {
-            if e.status != EntryStatus::Pending || e.sql.trim().is_empty() {
-                return false;
-            }
-            if e.txn_id == 0 {
-                return true;
-            }
-            committed.contains(&e.txn_id) && !aborted.contains(&e.txn_id)
-        })
-        .cloned()
-        .collect()
-}
-
 /// Extracts a string representation from an array cell for FTS tokenization.
 fn array_value_to_string(array: &dyn Array, row: usize) -> String {
     if array.is_null(row) {
@@ -7076,79 +7650,7 @@ fn array_value_to_sql_literal(array: &dyn Array, row: usize) -> String {
     )
 }
 
-/// Rewrites PostgreSQL-style `EXPLAIN (FORMAT JSON)` into `DataFusion`'s
-/// accepted form by stripping unsupported option lists.
-fn normalize_explain_sql(sql: &str) -> String {
-    let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
-    if upper.starts_with("EXPLAIN (") {
-        let open_idx = trimmed.find('(');
-        let close_idx = trimmed.find(')');
-        if let (Some(open), Some(close)) = (open_idx, close_idx) {
-            if close > open {
-                let opts = upper[open + 1..close].trim();
-                let has_analyze = opts.split(',').any(|o| o.trim() == "ANALYZE");
-                let rest = trimmed[close + 1..].trim();
-                if !rest.is_empty() {
-                    return if has_analyze {
-                        format!("EXPLAIN ANALYZE {rest}")
-                    } else {
-                        format!("EXPLAIN {rest}")
-                    };
-                }
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
-/// Strips `AS OF TIMESTAMP '...'` from a SQL statement.
-fn strip_as_of_timestamp(sql: &str) -> String {
-    let upper = sql.to_uppercase();
-    let Some(idx) = upper.find(" AS OF TIMESTAMP ") else {
-        return sql.to_string();
-    };
-    let after = &sql[idx + " AS OF TIMESTAMP ".len()..];
-    let mut skip = 0usize;
-    if let Some(stripped) = after.strip_prefix('\'') {
-        if let Some(end_quote) = stripped.find('\'') {
-            skip = 1 + end_quote + 1;
-        }
-    } else {
-        skip = after.find(' ').unwrap_or(after.len());
-    }
-    let mut rewritten = String::new();
-    rewritten.push_str(&sql[..idx]);
-    rewritten.push_str(after.get(skip..).unwrap_or_default());
-    rewritten
-}
-
-fn parse_as_of_timestamp(sql: &str) -> Option<i64> {
-    let upper = sql.to_uppercase();
-    let idx = upper.find(" AS OF TIMESTAMP ")?;
-    let after = sql[idx + " AS OF TIMESTAMP ".len()..].trim_start();
-    let token = if let Some(stripped) = after.strip_prefix('\'') {
-        let end = stripped.find('\'')?;
-        stripped[..end].to_string()
-    } else {
-        after
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(';')
-            .to_string()
-    };
-    if token.is_empty() {
-        return None;
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&token) {
-        return Some(dt.timestamp_millis());
-    }
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&token, "%Y-%m-%d %H:%M:%S") {
-        return Some(naive.and_utc().timestamp_millis());
-    }
-    token.parse::<i64>().ok()
-}
+// SQL helper routines are maintained in `sql_helpers` to keep this file smaller.
 
 /// Converts a sqlparser column definition into a catalog [`ColumnDef`].
 fn sql_column_to_catalog(col: &SqlColumnDef) -> ColumnDef {
@@ -7254,7 +7756,7 @@ fn sqlparser_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, BoxError>
     }
 }
 
-/// Maps a SQL type string to a PostgreSQL pg_type OID for pg_catalog compatibility.
+/// Maps a SQL type string to a `PostgreSQL` `pg_type` OID for `pg_catalog` compatibility.
 fn sql_type_to_pg_oid(sql_type: &str) -> i32 {
     let upper = sql_type.to_uppercase();
     if upper.contains("BIGINT") {
