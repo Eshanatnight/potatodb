@@ -26,6 +26,7 @@ Recent engine extensions include:
 - PL/pgSQL compatibility, triggers, and `MERGE` support; built-ins like `generate_series`
 - Prometheus metrics for observability and connection pooling support
 - persisted RBAC (roles/privileges) stored in the catalog
+- in-memory storage (`:memory:` / `memory://...`) via `object_store::memory::InMemory` (no WAL; ephemeral)
 - TUI and REPL meta-commands (`\dt`, `\di`, `\dv`, `\d`, `\ds`, `\df`, `\du`, `\timing`)
 - `\timing` toggle for detailed per-query timing and I/O metrics in REPL and TUI
 - deferred auto-analyze (moved off the insert hot path)
@@ -46,23 +47,27 @@ Recent engine extensions include:
 6. [Indexes](#indexes)
 7. [Parquet tuning](#parquet-tuning)
 8. [S3 integration](#s3-integration)
-9. [REPL](#repl)
-10. [TUI](#tui)
-11. [CLI arguments](#cli-arguments)
-12. [CLI file execution](#cli-file-execution)
-13. [C / C++ FFI](#c--c-ffi)
-14. [Runtime environment variables](#runtime-environment-variables)
-15. [Workspace layout](#workspace-layout)
-16. [Build & release profiles](#build--release-profiles)
-17. [Formatting conventions](#formatting-conventions)
-18. [Testing](#testing)
+9. [In-memory storage](#in-memory-storage)
+10. [REPL](#repl)
+11. [TUI](#tui)
+12. [CLI arguments](#cli-arguments)
+13. [CLI file execution](#cli-file-execution)
+14. [C / C++ FFI](#c--c-ffi)
+15. [Runtime environment variables](#runtime-environment-variables)
+16. [Workspace layout](#workspace-layout)
+17. [Build & release profiles](#build--release-profiles)
+18. [Formatting conventions](#formatting-conventions)
+19. [Testing](#testing)
 
 ---
 
 ## Storage model
 
-Every table is backed by a directory (local filesystem) or an object key
-prefix (S3). PotatoDB writes Parquet files through DataFusion `ListingTable`.
+Every table is backed by a directory (local filesystem), an object key
+prefix (S3), or the same prefix layout on an in-memory `ObjectStore`.
+PotatoDB writes Parquet files through DataFusion `ListingTable`.
+For S3 and in-memory backends, table listing URLs use a trailing `/` so
+DataFusion treats each table location as a directory rather than a single file.
 For local writes, the engine can buffer inserts in memory and flush by
 row/byte/time thresholds, which reduces tiny-file churn on write-heavy
 workloads. `SELECT` queries transparently read across all files in the
@@ -95,7 +100,7 @@ engine crate and apply to every `INSERT INTO` and `CREATE INDEX` write.
 
 The catalog is the single source of truth for what tables and indexes
 exist. It is serialized as JSON and persisted through the `ObjectStore`
-trait, so the same code path works for both local files and S3.
+trait, so the same code path works for local files, S3, and in-memory storage.
 
 ### On-disk format
 
@@ -151,6 +156,7 @@ etc.) serialize the full catalog through `ObjectStore::put`. For local
 databases, mutating SQL statements are written to `wal.log` before execution
 and replayed on restart. For S3 databases, WAL entries are persisted as JSON
 under `_wal/entries.json` in the configured prefix and replayed similarly.
+In-memory databases skip WAL entirely; catalog state exists only in RAM.
 
 ---
 
@@ -162,10 +168,11 @@ under `_wal/entries.json` in the configured prefix and replayed similarly.
 |---------------|---------------------------|----------------------------------------|
 | `ctx`         | `SessionContext`          | DataFusion query engine                |
 | `catalog`     | `Catalog`                 | Persistent table/index metadata        |
-| `data_url`    | `String`                  | Canonical base path or `s3://` URL     |
+| `data_url`    | `String`                  | Canonical base path, `s3://`, or `memory://` URL |
 | `store`       | `Arc<dyn ObjectStore>`    | Parquet + catalog I/O                  |
 | `is_s3`       | `bool`                    | Quick backend check                    |
-| `s3_prefix`   | `String`                  | Key prefix within the S3 bucket        |
+| `is_memory`   | `bool`                    | `true` for in-memory `InMemory` store  |
+| `s3_prefix`   | `String`                  | Key prefix (S3 bucket or `memory://` path) |
 | `wal`         | `Option<Wal>`             | Local write-ahead log handle           |
 | `write_buffer`| `HashMap<...>`            | Per-table buffered INSERT batches      |
 
@@ -186,11 +193,12 @@ significantly cheaper on large tables.
 On construction (`PotatoDB::new`), the engine:
 
 1. Configures a `SessionConfig` with tuned Parquet options.
-2. Sets up the appropriate `ObjectStore` (local `LocalFileSystem` or
-   `AmazonS3`).
-3. Registers the store with DataFusion (S3 only).
+2. Sets up the appropriate `ObjectStore` (local `LocalFileSystem`,
+   `AmazonS3`, or `InMemory`).
+3. Registers the store with DataFusion (S3 and in-memory).
 4. Loads the catalog from `catalog.json`.
-5. Opens/replays `wal.log` for local storage, then checkpoints it.
+5. Opens/replays `wal.log` for local storage (and S3 WAL when configured), then
+   checkpoints as appropriate. Skips WAL setup entirely for in-memory mode.
 6. Re-registers persisted tables as `ListingTable`s (concurrently), including
    sort-order hints from any indexes.
 
@@ -208,6 +216,8 @@ For local backends, PotatoDB uses `crates/wal` as an append-only journal:
 
 `Wal::append()` flushes and `sync_data()`s writes. In S3 mode, WAL entries are
 stored in object storage (`_wal/entries.json`) and replayed on startup.
+
+In-memory mode does not open or replay any WAL (including Arrow IPC WAL).
 
 ### Arrow IPC WAL
 
@@ -228,7 +238,7 @@ SQL string
   ▼
 sqlparser::Parser  (PostgreSQL dialect)
   │
-  ├─ CreateTable  ──► handle_create_table()  ──► mkdir + register ListingTable + save catalog
+  ├─ CreateTable  ──► handle_create_table()  ──► mkdir (local only) + register ListingTable + save catalog
   ├─ Insert       ──► handle_insert()        ──► buffer or immediate write + constraints
   ├─ CreateIndex  ──► handle_create_index()  ──► sort data + rewrite Parquet + save catalog
   ├─ Drop(Table)  ──► handle_drop_table()    ──► deregister + delete files + save catalog
@@ -388,6 +398,26 @@ the table's key prefix and deletes them one by one via `ObjectStore::delete`.
 
 ---
 
+## In-memory storage
+
+When `data_url` is `:memory:`, `memory` (case-insensitive), or starts with
+`memory://`, the engine:
+
+1. Parses an optional host (default `potatodb`) and optional path prefix,
+   mirroring S3 `s3://bucket/prefix` layout.
+2. Builds an [`InMemory`](https://docs.rs/object_store/latest/object_store/memory/struct.InMemory.html)
+   store and registers it with DataFusion:
+   `ctx.register_object_store(&Url::parse("memory://host/")?, store)`.
+3. Sets `is_memory` and keeps `wal` / `ArrowWal` as `None`; no CDC log path on
+   disk.
+4. Stores catalog and Parquet objects under the same key-prefix rules as S3
+   (`catalog.json` or `{prefix}/catalog.json`).
+
+`PotatoDB::is_in_memory()` exposes the mode to callers. `backup` and `restore`
+return an error (as with S3): there is no local directory tree to archive.
+
+---
+
 ## REPL
 
 The `potatodb-repl` crate provides a line-mode SQL shell using `rustyline`.
@@ -447,7 +477,7 @@ metrics in the status bar.
 
 | Argument | Type | Default | Env | Description |
 |----------|------|---------|-----|-------------|
-| `--data-dir` | `String` | `./potatodb_data` | | Storage location (local path or `s3://` URL) |
+| `--data-dir` | `String` | `./potatodb_data` | | Storage location (local path, `s3://` URL, `:memory:`, or `memory://...`) |
 | `--s3-endpoint` | `String` | | | S3-compatible endpoint URL |
 | `--s3-region` | `String` | `us-east-1` | | AWS/S3 region |
 | `--s3-allow-http` | `bool` | `false` | | Allow plain HTTP to S3 (for MinIO, etc.) |

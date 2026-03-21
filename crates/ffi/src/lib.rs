@@ -211,11 +211,12 @@ fn arrow_value_to_string(arr: &dyn Array, index: usize) -> Option<String> {
 // Database lifecycle
 // ---------------------------------------------------------------------------
 
-/// Opens a database at `data_dir` (local path or `s3://` URL).
+/// Opens a database at `data_dir` (local path, `s3://` URL, or in-memory
+/// `:memory:` / `memory://...`).
 ///
-/// Returns a handle on success, or `NULL` on failure.  When S3 is used,
+/// Returns a handle on success, or `NULL` on failure. When S3 is used,
 /// pass endpoint / region / `allow_http`; set pointers to `NULL` / `false`
-/// for defaults.
+/// for defaults. In-memory URLs ignore S3 parameters.
 ///
 /// # Safety
 /// Any non-NULL pointer argument must be valid for reads for the duration of
@@ -262,7 +263,9 @@ pub unsafe extern "C" fn potato_open(
     }))
 }
 
-/// Opens a local database (convenience wrapper -- no S3 parameters).
+/// Opens a database (convenience wrapper — no S3 parameters).
+///
+/// `data_dir` may be a filesystem path, `:memory:` / `memory://...`, etc.
 ///
 /// # Safety
 /// Any non-NULL pointer argument must be valid for reads for the duration of

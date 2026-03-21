@@ -76,7 +76,7 @@ Environment variables for the server:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POTATODB_DATA_DIR` | `./pgwire_example_data` | Database storage path |
+| `POTATODB_DATA_DIR` | `./pgwire_example_data` | Database storage path (local dir, `s3://...`, `:memory:`, or `memory://...`) |
 | `POTATODB_BIND` | `127.0.0.1:5433` | Listen address |
 | `POTATODB_USER` | `potatodb` | Login username |
 | `POTATODB_PASSWORD` | `potatodb` | Login password |
