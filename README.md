@@ -2,7 +2,7 @@
 
 A Parquet-backed SQL database written in Rust, powered by [Apache DataFusion](https://datafusion.apache.org/).
 
-![Rust](https://img.shields.io/badge/Rust-2021-orange)
+![Rust](https://img.shields.io/badge/Rust-2024-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## Features
