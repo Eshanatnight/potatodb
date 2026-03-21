@@ -277,10 +277,10 @@ impl ArrowWal {
             }
             let sub_entries = fs::read_dir(entry.path()).ok()?;
             for sub in sub_entries.filter_map(Result::ok) {
-                if let Some(stem) = sub.path().file_stem() {
-                    if let Ok(n) = stem.to_string_lossy().parse::<u64>() {
-                        max_seq = Some(max_seq.map_or(n, |m: u64| m.max(n)));
-                    }
+                if let Some(stem) = sub.path().file_stem()
+                    && let Ok(n) = stem.to_string_lossy().parse::<u64>()
+                {
+                    max_seq = Some(max_seq.map_or(n, |m: u64| m.max(n)));
                 }
             }
         }

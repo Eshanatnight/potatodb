@@ -22,14 +22,14 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, DurationMicrosecondArray, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
     UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use async_trait::async_trait;
-use futures::stream;
 use futures::Sink;
-use pgwire::api::auth::md5pass::{hash_md5_password, Md5PasswordAuthStartupHandler};
+use futures::stream;
+use pgwire::api::auth::md5pass::{Md5PasswordAuthStartupHandler, hash_md5_password};
 use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -43,9 +43,9 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration};
-use tokio_rustls::rustls::ServerConfig;
+use tokio::time::{Duration, sleep};
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
 
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};

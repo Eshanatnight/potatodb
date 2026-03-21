@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     LargeStringArray, StringArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -48,11 +48,11 @@ use arrow::{csv, json};
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::catalog::Session;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Column;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{
-    stats::Precision, ColumnStatistics as DfColumnStatistics, ScalarValue,
-    Statistics as DfStatistics,
+    ColumnStatistics as DfColumnStatistics, ScalarValue, Statistics as DfStatistics,
+    stats::Precision,
 };
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
@@ -64,15 +64,15 @@ use datafusion::logical_expr::{
     Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
 };
 use datafusion::optimizer::OptimizerRule;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::*;
 use futures::TryStreamExt;
+use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjPath;
-use object_store::ObjectStore;
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType,
     ExactNumberInfo, MergeAction, MergeClauseKind, MergeInsertKind, ObjectType, OnConflict,
@@ -876,21 +876,21 @@ impl PotatoDB {
             replicas: Vec::new(),
         };
         db.reload_tables().await?;
-        if let Some(path) = &db.cdc_log_path {
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                for line in contents.lines() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                        db.cdc_log.push_back(CdcEvent {
-                            table: val["table"].as_str().unwrap_or("").to_string(),
-                            op: val["op"].as_str().unwrap_or("").to_string(),
-                            timestamp_ms: val["timestamp_ms"].as_i64().unwrap_or(0),
-                            rows: val["rows"].as_u64().unwrap_or(0) as usize,
-                        });
-                    }
+        if let Some(path) = &db.cdc_log_path
+            && let Ok(contents) = std::fs::read_to_string(path)
+        {
+            for line in contents.lines() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    db.cdc_log.push_back(CdcEvent {
+                        table: val["table"].as_str().unwrap_or("").to_string(),
+                        op: val["op"].as_str().unwrap_or("").to_string(),
+                        timestamp_ms: val["timestamp_ms"].as_i64().unwrap_or(0),
+                        rows: val["rows"].as_u64().unwrap_or(0) as usize,
+                    });
                 }
-                while db.cdc_log.len() > db.cdc_capacity {
-                    let _ = db.cdc_log.pop_front();
-                }
+            }
+            while db.cdc_log.len() > db.cdc_capacity {
+                let _ = db.cdc_log.pop_front();
             }
         }
         let _ = db.capture_snapshot().await;
@@ -1117,24 +1117,18 @@ impl PotatoDB {
             let mut row_count = None;
             let mut min_values = HashMap::new();
             let mut max_values = HashMap::new();
-            if !self.is_s3 {
-                if let Some(meta) = table_meta.as_ref() {
-                    if let Some(filename) = entry.location.as_ref().rsplit('/').next() {
-                        let local_path = PathBuf::from(&meta.path).join(filename);
-                        if local_path.exists() {
-                            if let Ok(file) = File::open(&local_path) {
-                                if let Ok(reader) = SerializedFileReader::new(file) {
-                                    let pq_meta = reader.metadata();
-                                    row_count = Some(pq_meta.file_metadata().num_rows() as u64);
-                                    collect_minmax_from_parquet(
-                                        pq_meta,
-                                        &mut min_values,
-                                        &mut max_values,
-                                    );
-                                }
-                            }
-                        }
-                    }
+            if !self.is_s3
+                && let Some(meta) = table_meta.as_ref()
+                && let Some(filename) = entry.location.as_ref().rsplit('/').next()
+            {
+                let local_path = PathBuf::from(&meta.path).join(filename);
+                if local_path.exists()
+                    && let Ok(file) = File::open(&local_path)
+                    && let Ok(reader) = SerializedFileReader::new(file)
+                {
+                    let pq_meta = reader.metadata();
+                    row_count = Some(pq_meta.file_metadata().num_rows() as u64);
+                    collect_minmax_from_parquet(pq_meta, &mut min_values, &mut max_values);
                 }
             }
 
@@ -1240,10 +1234,10 @@ impl PotatoDB {
         }
         let incoming_bytes = estimate_batch_bytes(&batches);
 
-        if let Some(existing) = self.write_buffer.get(table_name) {
-            if existing.columns != columns {
-                self.flush_table(table_name).await?;
-            }
+        if let Some(existing) = self.write_buffer.get(table_name)
+            && existing.columns != columns
+        {
+            self.flush_table(table_name).await?;
         }
 
         let entry = self
@@ -1262,10 +1256,10 @@ impl PotatoDB {
             entry.first_buffered_at = Instant::now();
         }
 
-        if !self.replaying_wal {
-            if let Some(ref mut awal) = self.arrow_wal {
-                awal.append(table_name, &batches)?;
-            }
+        if !self.replaying_wal
+            && let Some(ref mut awal) = self.arrow_wal
+        {
+            awal.append(table_name, &batches)?;
         }
 
         entry.batches.extend(batches);
@@ -1914,11 +1908,11 @@ impl PotatoDB {
             self.delete_table_storage(meta).await?;
         }
 
-        if !self.replaying_wal {
-            if let Some(wal) = self.wal.as_mut() {
-                wal.commit(txn.wal_txn_id)?;
-                wal.checkpoint()?;
-            }
+        if !self.replaying_wal
+            && let Some(wal) = self.wal.as_mut()
+        {
+            wal.commit(txn.wal_txn_id)?;
+            wal.checkpoint()?;
         }
         if self.snapshots_enabled {
             let _ = self.capture_snapshot().await;
@@ -1973,11 +1967,11 @@ impl PotatoDB {
             }
         }
 
-        if !self.replaying_wal {
-            if let Some(wal) = self.wal.as_mut() {
-                wal.abort(txn.wal_txn_id)?;
-                wal.checkpoint()?;
-            }
+        if !self.replaying_wal
+            && let Some(wal) = self.wal.as_mut()
+        {
+            wal.abort(txn.wal_txn_id)?;
+            wal.checkpoint()?;
         }
 
         Ok(QueryResult::Message("ROLLBACK".into()))
@@ -2513,9 +2507,9 @@ impl PotatoDB {
             Statement::CreateTable(create) => self.handle_create_table(create).await,
             Statement::CreateIndex(create_idx) => self.handle_create_index(create_idx).await,
             Statement::CreateSequence {
-                ref name,
+                name,
                 if_not_exists,
-                ref sequence_options,
+                sequence_options,
                 ..
             } => {
                 self.handle_create_sequence(&name.to_string(), *if_not_exists, sequence_options)
@@ -2569,11 +2563,11 @@ impl PotatoDB {
                     .unwrap_or_default();
                 self.handle_drop_sequence(&name, *if_exists).await
             }
-            Statement::Delete(ref delete) => self.handle_delete(sql, delete).await,
+            Statement::Delete(delete) => self.handle_delete(sql, delete).await,
             Statement::Update {
-                ref table,
-                ref assignments,
-                ref selection,
+                table,
+                assignments,
+                selection,
                 ..
             } => {
                 self.handle_update(sql, table, assignments, selection.as_ref())
@@ -2581,15 +2575,15 @@ impl PotatoDB {
             }
             Statement::Insert(insert) => self.handle_insert(sql, insert).await,
             Statement::Merge {
-                ref table,
-                ref source,
-                ref on,
-                ref clauses,
+                table,
+                source,
+                on,
+                clauses,
                 ..
             } => self.handle_merge(table, source, on, clauses).await,
             Statement::AlterTable {
-                ref name,
-                ref operations,
+                name,
+                operations,
                 if_exists,
                 ..
             } => {
@@ -2597,8 +2591,8 @@ impl PotatoDB {
                     .await
             }
             Statement::CreateView {
-                ref name,
-                ref query,
+                name,
+                query,
                 materialized,
                 or_replace,
                 ..
@@ -2607,17 +2601,13 @@ impl PotatoDB {
                     .await
             }
             Statement::Prepare {
-                ref name,
-                ref statement,
-                ..
+                name, statement, ..
             } => {
                 self.handle_prepare(&name.to_string(), &statement.to_string())
                     .await
             }
             Statement::Execute {
-                ref name,
-                ref parameters,
-                ..
+                name, parameters, ..
             } => {
                 let stmt_name = name
                     .as_ref()
@@ -2638,10 +2628,10 @@ impl PotatoDB {
                 let batches = self.collect_with_plan_cache(&normalized).await?;
                 Ok(QueryResult::Records(batches))
             }
-            Statement::Analyze { ref table_name, .. } => {
+            Statement::Analyze { table_name, .. } => {
                 self.handle_analyze(&table_name.to_string()).await
             }
-            Statement::Vacuum(ref v) => {
+            Statement::Vacuum(v) => {
                 let tbl = v
                     .table_name
                     .as_ref()
@@ -2873,23 +2863,22 @@ impl PotatoDB {
     async fn collect_with_plan_cache(&mut self, sql: &str) -> Result<Vec<RecordBatch>, BoxError> {
         if is_read_only_sql(sql) {
             for table_name in extract_table_names_from_readonly_sql(sql) {
-                if let Some(meta) = self.catalog.tables.get(&table_name) {
-                    if !meta.partition_columns.is_empty() {
-                        eprintln!(
-                            "potatodb: query touches partitioned table '{}' (partition cols: {:?}). \
+                if let Some(meta) = self.catalog.tables.get(&table_name)
+                    && !meta.partition_columns.is_empty()
+                {
+                    eprintln!(
+                        "potatodb: query touches partitioned table '{}' (partition cols: {:?}). \
                              Partition pruning not yet implemented.",
-                            table_name,
-                            meta.partition_columns
-                        );
-                    }
+                        table_name, meta.partition_columns
+                    );
                 }
             }
             if let Some(plan) = self.plan_cache.get(sql).cloned() {
-                if let Ok(df) = self.ctx.execute_logical_plan(plan).await {
-                    if let Ok(batches) = df.collect().await {
-                        self.plan_cache_hits = self.plan_cache_hits.saturating_add(1);
-                        return Ok(batches);
-                    }
+                if let Ok(df) = self.ctx.execute_logical_plan(plan).await
+                    && let Ok(batches) = df.collect().await
+                {
+                    self.plan_cache_hits = self.plan_cache_hits.saturating_add(1);
+                    return Ok(batches);
                 }
                 self.plan_cache.remove(sql);
             }
@@ -3016,20 +3005,19 @@ impl PotatoDB {
         while self.cdc_log.len() > self.cdc_capacity {
             let _ = self.cdc_log.pop_front();
         }
-        if let Some(path) = &self.cdc_log_path {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
+        if let Some(path) = &self.cdc_log_path
+            && let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-            {
-                let line = serde_json::json!({
-                    "table": table,
-                    "op": op,
-                    "timestamp_ms": timestamp_ms,
-                    "rows": rows
-                });
-                let _ = writeln!(f, "{line}");
-            }
+        {
+            let line = serde_json::json!({
+                "table": table,
+                "op": op,
+                "timestamp_ms": timestamp_ms,
+                "rows": rows
+            });
+            let _ = writeln!(f, "{line}");
         }
     }
 
@@ -4185,16 +4173,15 @@ impl PotatoDB {
             .indexes
             .values()
             .any(|idx| idx.table_name == *table_name && idx.primary);
-        if !has_primary {
-            if let Some((_, next_idx)) = self
+        if !has_primary
+            && let Some((_, next_idx)) = self
                 .catalog
                 .indexes
                 .iter_mut()
                 .find(|(_, idx)| idx.table_name == *table_name)
-            {
-                next_idx.primary = true;
-                next_idx.logical_only = false;
-            }
+        {
+            next_idx.primary = true;
+            next_idx.logical_only = false;
         }
         if let Some(meta) = self.catalog.tables.get(table_name).cloned() {
             self.ctx.deregister_table(table_name)?;
@@ -4381,16 +4368,16 @@ impl PotatoDB {
                         on_delete,
                         ..
                     } = c
+                        && ref_table == &table_name
+                        && columns.len() == 1
+                        && ref_columns.len() == 1
                     {
-                        if ref_table == &table_name && columns.len() == 1 && ref_columns.len() == 1
-                        {
-                            return Some((
-                                child_table.clone(),
-                                columns[0].clone(),
-                                ref_columns[0].clone(),
-                                on_delete.clone().unwrap_or_else(|| "RESTRICT".to_string()),
-                            ));
-                        }
+                        return Some((
+                            child_table.clone(),
+                            columns[0].clone(),
+                            ref_columns[0].clone(),
+                            on_delete.clone().unwrap_or_else(|| "RESTRICT".to_string()),
+                        ));
                     }
                     None
                 })
@@ -5157,12 +5144,11 @@ impl PotatoDB {
 
         let removed = self.catalog.remove_view(name).await?;
         let _ = self.ctx.deregister_table(name);
-        if let Some(view) = removed {
-            if view.materialized {
-                if let Some(backing) = view.backing_table {
-                    let _ = self.handle_drop_table(&backing, true).await;
-                }
-            }
+        if let Some(view) = removed
+            && view.materialized
+            && let Some(backing) = view.backing_table
+        {
+            let _ = self.handle_drop_table(&backing, true).await;
         }
         Ok(QueryResult::Message(format!("View '{name}' dropped.")))
     }
@@ -5794,7 +5780,7 @@ impl PotatoDB {
             Ok(df) => Some(df.logical_plan().clone()),
             Err(_) => None,
         };
-        if let (true, Some(ref plan)) = (is_read_only_sql(sql_template), &logical_plan) {
+        if let (true, Some(plan)) = (is_read_only_sql(sql_template), &logical_plan) {
             self.plan_cache
                 .insert(sql_template.to_string(), plan.clone());
         }
@@ -5982,10 +5968,10 @@ impl PotatoDB {
             .sum();
 
         let output_path = PathBuf::from(file_path);
-        if let Some(parent) = output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = output_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let file = File::create(&output_path)?;
 
@@ -6557,13 +6543,14 @@ impl PotatoDB {
                 .ok_or_else(|| format!("Prepared statement '{name}' does not exist"))?
                 .clone();
 
-            if parameters.is_empty() && is_read_only_sql(&stmt.sql_template) {
-                if let Some(plan) = stmt.logical_plan.clone() {
-                    let _ = self.flush_all().await?;
-                    if let Ok(df) = self.ctx.execute_logical_plan(plan).await {
-                        let batches = df.collect().await?;
-                        return Ok(QueryResult::Records(batches));
-                    }
+            if parameters.is_empty()
+                && is_read_only_sql(&stmt.sql_template)
+                && let Some(plan) = stmt.logical_plan.clone()
+            {
+                let _ = self.flush_all().await?;
+                if let Ok(df) = self.ctx.execute_logical_plan(plan).await {
+                    let batches = df.collect().await?;
+                    return Ok(QueryResult::Records(batches));
                 }
             }
 
@@ -6649,12 +6636,13 @@ fn substitute_parameters(template: &str, params: &[sqlparser::ast::Expr]) -> Str
             while end < bytes.len() && bytes[end].is_ascii_digit() {
                 end += 1;
             }
-            if let Ok(idx) = template[start..end].parse::<usize>() {
-                if idx >= 1 && idx <= param_strs.len() {
-                    result.push_str(&param_strs[idx - 1]);
-                    i = end;
-                    continue;
-                }
+            if let Ok(idx) = template[start..end].parse::<usize>()
+                && idx >= 1
+                && idx <= param_strs.len()
+            {
+                result.push_str(&param_strs[idx - 1]);
+                i = end;
+                continue;
             }
         }
         result.push(bytes[i] as char);
@@ -7614,34 +7602,33 @@ fn array_value_to_sql_literal(array: &dyn Array, row: usize) -> String {
     if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
         return format!("'{}'", a.value(row).replace('\'', "''"));
     }
-    if matches!(array.data_type(), DataType::FixedSizeBinary(16)) {
-        if let Some(a) = array
+    if matches!(array.data_type(), DataType::FixedSizeBinary(16))
+        && let Some(a) = array
             .as_any()
             .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
-        {
-            let bytes = a.value(row);
-            if bytes.len() == 16 {
-                let uuid = format!(
-                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    bytes[0],
-                    bytes[1],
-                    bytes[2],
-                    bytes[3],
-                    bytes[4],
-                    bytes[5],
-                    bytes[6],
-                    bytes[7],
-                    bytes[8],
-                    bytes[9],
-                    bytes[10],
-                    bytes[11],
-                    bytes[12],
-                    bytes[13],
-                    bytes[14],
-                    bytes[15]
-                );
-                return format!("'{uuid}'");
-            }
+    {
+        let bytes = a.value(row);
+        if bytes.len() == 16 {
+            let uuid = format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                bytes[6],
+                bytes[7],
+                bytes[8],
+                bytes[9],
+                bytes[10],
+                bytes[11],
+                bytes[12],
+                bytes[13],
+                bytes[14],
+                bytes[15]
+            );
+            return format!("'{uuid}'");
         }
     }
     format!(
@@ -7685,10 +7672,10 @@ fn sql_string_to_arrow(sql_type: &str) -> Result<DataType, BoxError> {
     let dialect = PostgreSqlDialect {};
     let dummy = format!("CREATE TABLE _t (_c {sql_type})");
     let stmts = Parser::parse_sql(&dialect, &dummy)?;
-    if let Statement::CreateTable(create) = &stmts[0] {
-        if let Some(col) = create.columns.first() {
-            return sqlparser_type_to_arrow(&col.data_type);
-        }
+    if let Statement::CreateTable(create) = &stmts[0]
+        && let Some(col) = create.columns.first()
+    {
+        return sqlparser_type_to_arrow(&col.data_type);
     }
     Err(format!("Cannot parse SQL type: {sql_type}").into())
 }

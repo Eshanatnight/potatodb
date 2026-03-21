@@ -10,12 +10,12 @@ use std::time::Instant;
 
 use rustyline::completion::{Completer, Pair};
 
+use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::Editor;
 use rustyline::{Context, Helper};
 
 use potatodb_display as display;

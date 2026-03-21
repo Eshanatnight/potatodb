@@ -2520,12 +2520,16 @@ async fn test_multiple_indexes_and_introspection() {
         .unwrap();
 
     let indexes = db.indexes();
-    assert!(indexes
-        .iter()
-        .any(|(n, t)| n == "idx_midx_a" && t == "midx"));
-    assert!(indexes
-        .iter()
-        .any(|(n, t)| n == "idx_midx_b" && t == "midx"));
+    assert!(
+        indexes
+            .iter()
+            .any(|(n, t)| n == "idx_midx_a" && t == "midx")
+    );
+    assert!(
+        indexes
+            .iter()
+            .any(|(n, t)| n == "idx_midx_b" && t == "midx")
+    );
 }
 
 #[tokio::test]
@@ -2767,10 +2771,11 @@ async fn test_foreign_key_restrict_and_insert_validation() {
         "FK should reject missing parent references"
     );
 
-    assert!(db
-        .execute("DELETE FROM parent WHERE id = 1;")
-        .await
-        .is_err());
+    assert!(
+        db.execute("DELETE FROM parent WHERE id = 1;")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
