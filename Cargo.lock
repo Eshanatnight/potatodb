@@ -3667,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "clap",
  "mimalloc",
@@ -3681,7 +3681,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-catalog"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "object_store",
  "serde",
@@ -3692,7 +3692,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-display"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-engine"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "async-recursion",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-examples"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "potatodb-display",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-ffi"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "futures",
@@ -3747,7 +3747,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-http"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "axum",
@@ -3764,14 +3764,14 @@ dependencies = [
 
 [[package]]
 name = "potatodb-nodejs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "potatodb-engine",
 ]
 
 [[package]]
 name = "potatodb-python"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "futures",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-repl"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "potatodb-display",
  "potatodb-engine",
@@ -3791,7 +3791,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3807,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-tui"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "chrono",
@@ -3818,7 +3818,7 @@ dependencies = [
 
 [[package]]
 name = "potatodb-wal"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arrow",
  "crc32fast",
