@@ -102,6 +102,15 @@ use sql_helpers::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Which part of constraint validation to run for a batch insert/flush.
+#[derive(Clone, Copy)]
+enum ConstraintValidationPhase {
+    /// PK, UNIQUE, CHECK (not FK). Returns merge keys for uniqueness cache.
+    BeforeInsert,
+    /// FOREIGN KEY only (requires child rows to exist on disk).
+    AfterInsert,
+}
+
 /// The result of executing a SQL statement.
 pub enum QueryResult {
     /// Row data returned by a SELECT or similar query.
@@ -485,6 +494,11 @@ pub struct PotatoDB {
     last_query_metrics: QueryMetrics,
     /// Replica URLs for WAL-based read replication (metadata only).
     replicas: Vec<String>,
+    /// In-memory sets of serialized key tuples (`col1\x1fcol2...`) for PRIMARY KEY
+    /// and UNIQUE constraints. Loaded lazily from disk once per table/constraint,
+    /// then updated incrementally on successful inserts to avoid repeated full-table
+    /// scans. Cleared when table data is rewritten or truncated.
+    uniqueness_cache: HashMap<String, HashSet<String>>,
 }
 
 /// Returns the Parquet compression setting from `POTATODB_PARQUET_COMPRESSION`,
@@ -871,9 +885,10 @@ impl PotatoDB {
             snapshots: VecDeque::new(),
             snapshot_retention_ms,
             snapshots_enabled: false,
-            auto_compact_file_threshold: 20,
+            auto_compact_file_threshold: 64,
             last_query_metrics: QueryMetrics::default(),
             replicas: Vec::new(),
+            uniqueness_cache: HashMap::new(),
         };
         db.reload_tables().await?;
         if let Some(path) = &db.cdc_log_path
@@ -1240,20 +1255,72 @@ impl PotatoDB {
             self.flush_table(table_name).await?;
         }
 
-        let entry = self
-            .write_buffer
-            .entry(table_name.to_string())
-            .or_insert_with(|| BufferedInsert {
-                columns: columns.clone(),
-                batches: Vec::new(),
-                row_count: 0,
-                approx_bytes: 0,
-                first_buffered_at: Instant::now(),
-            });
+        let (prev_batches_len, prev_row_count, prev_bytes) = {
+            let entry = self
+                .write_buffer
+                .entry(table_name.to_string())
+                .or_insert_with(|| BufferedInsert {
+                    columns: columns.clone(),
+                    batches: Vec::new(),
+                    row_count: 0,
+                    approx_bytes: 0,
+                    first_buffered_at: Instant::now(),
+                });
 
-        if entry.batches.is_empty() {
-            entry.columns = columns;
-            entry.first_buffered_at = Instant::now();
+            if entry.batches.is_empty() {
+                entry.columns = columns;
+                entry.first_buffered_at = Instant::now();
+            }
+
+            let prev_batches_len = entry.batches.len();
+            let prev_row_count = entry.row_count;
+            let prev_bytes = entry.approx_bytes;
+
+            entry.batches.extend(batches.clone());
+            entry.row_count = entry.row_count.saturating_add(incoming_rows);
+            entry.approx_bytes = entry.approx_bytes.saturating_add(incoming_bytes);
+
+            (prev_batches_len, prev_row_count, prev_bytes)
+        };
+
+        let (target_columns, batches_for_validate) = {
+            let entry = self
+                .write_buffer
+                .get(table_name)
+                .ok_or_else(|| -> BoxError {
+                    "buffer_insert_batches: missing buffer entry".into()
+                })?;
+            let target_columns: Vec<String> = if let Some(ref cols) = entry.columns {
+                cols.clone()
+            } else {
+                self.catalog
+                    .tables
+                    .get(table_name)
+                    .map(|m| m.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            };
+            (target_columns, entry.batches.clone())
+        };
+
+        if let Err(e) = self
+            .validate_constraints_batch(
+                table_name,
+                &target_columns,
+                &batches_for_validate,
+                ConstraintValidationPhase::BeforeInsert,
+            )
+            .await
+        {
+            let entry = self
+                .write_buffer
+                .get_mut(table_name)
+                .ok_or_else(|| -> BoxError {
+                    "buffer_insert_batches: missing buffer entry".into()
+                })?;
+            entry.batches.truncate(prev_batches_len);
+            entry.row_count = prev_row_count;
+            entry.approx_bytes = prev_bytes;
+            return Err(e);
         }
 
         if !self.replaying_wal
@@ -1262,13 +1329,13 @@ impl PotatoDB {
             awal.append(table_name, &batches)?;
         }
 
-        entry.batches.extend(batches);
-        entry.row_count = entry.row_count.saturating_add(incoming_rows);
-        entry.approx_bytes = entry.approx_bytes.saturating_add(incoming_bytes);
-
-        let should_flush = entry.row_count >= self.write_buffer_row_threshold
-            || entry.approx_bytes >= self.write_buffer_byte_threshold
-            || entry.first_buffered_at.elapsed() >= self.write_buffer_time_threshold;
+        let should_flush = if let Some(entry) = self.write_buffer.get(table_name) {
+            entry.row_count >= self.write_buffer_row_threshold
+                || entry.approx_bytes >= self.write_buffer_byte_threshold
+                || entry.first_buffered_at.elapsed() >= self.write_buffer_time_threshold
+        } else {
+            false
+        };
 
         if should_flush {
             self.flush_table(table_name).await?;
@@ -1300,7 +1367,13 @@ impl PotatoDB {
                 .unwrap_or_default()
         };
 
-        self.validate_constraints_batch(table_name, &target_columns, &buffered.batches)
+        let merges = self
+            .validate_constraints_batch(
+                table_name,
+                &target_columns,
+                &buffered.batches,
+                ConstraintValidationPhase::BeforeInsert,
+            )
             .await?;
 
         let row_count = buffered.row_count;
@@ -1326,6 +1399,22 @@ impl PotatoDB {
         let write_result = self.ctx.sql(&insert_sql).await?.collect().await.map(|_| ());
         let _ = self.ctx.deregister_table(&tmp_name);
         write_result?;
+
+        // FOREIGN KEY validation requires child rows to exist on disk.
+        let empty_batches: &[RecordBatch] = &[];
+        self.validate_constraints_batch(
+            table_name,
+            &target_columns,
+            empty_batches,
+            ConstraintValidationPhase::AfterInsert,
+        )
+        .await?;
+
+        if row_count > 0 {
+            for (cache_key, keys) in merges {
+                self.merge_uniqueness_keys(&cache_key, &keys);
+            }
+        }
 
         if let Some(ref mut awal) = self.arrow_wal {
             awal.checkpoint_table(table_name)?;
@@ -1371,7 +1460,8 @@ impl PotatoDB {
         let df = self.ctx.sql(&select_sql).await?;
         let schema = Arc::new(df.schema().as_arrow().clone());
         let batches = df.collect().await?;
-        self.rewrite_table(table_name, schema, batches).await?;
+        self.rewrite_table(table_name, schema, batches, true)
+            .await?;
         Ok(())
     }
 
@@ -1732,11 +1822,15 @@ impl PotatoDB {
     ///
     /// This is the core "copy-on-write rewrite" used by `DELETE`,
     /// `UPDATE`, `VACUUM`, and `CREATE INDEX`.
+    ///
+    /// When `use_batches_as_disk_snapshot` is `true`, `batches` is also used as the
+    /// rollback snapshot (caller already read the table — e.g. auto-compact).
     async fn rewrite_table(
         &mut self,
         table_name: &str,
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
+        use_batches_as_disk_snapshot: bool,
     ) -> Result<(), BoxError> {
         let table_meta = self
             .catalog
@@ -1745,12 +1839,17 @@ impl PotatoDB {
             .ok_or_else(|| format!("Table '{table_name}' does not exist"))?
             .clone();
 
-        let original_batches: Vec<RecordBatch> = self
-            .ctx
-            .sql(&format!("SELECT * FROM \"{table_name}\""))
-            .await?
-            .collect()
-            .await?;
+        self.invalidate_uniqueness_cache_for_table(table_name);
+
+        let original_batches: Vec<RecordBatch> = if use_batches_as_disk_snapshot {
+            batches.clone()
+        } else {
+            self.ctx
+                .sql(&format!("SELECT * FROM \"{table_name}\""))
+                .await?
+                .collect()
+                .await?
+        };
         let original_schema = if original_batches.is_empty() {
             None
         } else {
@@ -1963,7 +2062,7 @@ impl PotatoDB {
         for (table, batches) in txn.rewrite_backups {
             if let Some(meta) = self.catalog.tables.get(&table) {
                 let schema = columns_to_schema(&meta.columns)?;
-                self.rewrite_table(&table, schema, batches).await?;
+                self.rewrite_table(&table, schema, batches, false).await?;
             }
         }
 
@@ -2065,7 +2164,7 @@ impl PotatoDB {
         for (table, batches) in rewrite_backups {
             if let Some(meta) = self.catalog.tables.get(&table) {
                 let schema = columns_to_schema(&meta.columns)?;
-                self.rewrite_table(&table, schema, batches).await?;
+                self.rewrite_table(&table, schema, batches, false).await?;
             }
         }
 
@@ -4127,6 +4226,7 @@ impl PotatoDB {
             .await?
             .ok_or_else(|| format!("Table '{name}' does not exist"))?;
         self.ctx.deregister_table(name)?;
+        self.invalidate_uniqueness_cache_for_table(name);
 
         if self.in_transaction() {
             if let Some(txn) = self.active_txn.as_mut() {
@@ -4309,6 +4409,7 @@ impl PotatoDB {
 
         self.ctx.deregister_table(table_name)?;
         self.delete_parquet_files(table_name).await?;
+        self.invalidate_uniqueness_cache_for_table(table_name);
 
         let schema = columns_to_schema(&meta.columns)?;
         self.register_listing_table(table_name, schema, &meta.path, &meta.partition_columns)
@@ -4419,7 +4520,8 @@ impl PotatoDB {
                     let df = self.ctx.sql(&keep_sql).await?;
                     let schema = Arc::new(df.schema().as_arrow().clone());
                     let batches = df.collect().await?;
-                    self.rewrite_table(&child_table, schema, batches).await?;
+                    self.rewrite_table(&child_table, schema, batches, false)
+                        .await?;
                 }
                 "SET NULL" => {
                     let child_meta = self
@@ -4446,7 +4548,8 @@ impl PotatoDB {
                     let df = self.ctx.sql(&rewrite_sql).await?;
                     let schema = Arc::new(df.schema().as_arrow().clone());
                     let batches = df.collect().await?;
-                    self.rewrite_table(&child_table, schema, batches).await?;
+                    self.rewrite_table(&child_table, schema, batches, false)
+                        .await?;
                 }
                 _ => {
                     return Err(format!(
@@ -4502,7 +4605,8 @@ impl PotatoDB {
             .sum();
         let deleted = old_count as usize - new_count;
 
-        self.rewrite_table(&table_name, schema, surviving).await?;
+        self.rewrite_table(&table_name, schema, surviving, false)
+            .await?;
         if let Some(meta) = self.catalog.tables.get_mut(&table_name) {
             meta.deletion_vectors.clear();
         }
@@ -4614,7 +4718,8 @@ impl PotatoDB {
             modified[0].schema()
         };
 
-        self.rewrite_table(&table_name, schema, modified).await?;
+        self.rewrite_table(&table_name, schema, modified, false)
+            .await?;
         if let Some(meta) = self.catalog.tables.get_mut(&table_name) {
             meta.deletion_vectors.clear();
         }
@@ -4781,7 +4886,8 @@ impl PotatoDB {
                             } else {
                                 batches[0].schema()
                             };
-                            self.rewrite_table(&target_name, schema, batches).await?;
+                            self.rewrite_table(&target_name, schema, batches, false)
+                                .await?;
                         }
                     }
                     (MergeClauseKind::Matched, MergeAction::Delete) => {
@@ -4801,7 +4907,8 @@ impl PotatoDB {
                         } else {
                             batches[0].schema()
                         };
-                        self.rewrite_table(&target_name, schema, batches).await?;
+                        self.rewrite_table(&target_name, schema, batches, false)
+                            .await?;
                     }
                     (
                         MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
@@ -5232,8 +5339,12 @@ impl PotatoDB {
         let batches = source_df.collect().await?;
 
         let returning_clause = extract_returning_clause(sql);
+        let has_foreign_key = table_meta
+            .constraints
+            .iter()
+            .any(|c| matches!(c, CatalogTableConstraint::ForeignKey { .. }));
         let requires_immediate =
-            self.replaying_wal || returning_clause.is_some() || !table_meta.constraints.is_empty();
+            self.replaying_wal || returning_clause.is_some() || has_foreign_key;
 
         if requires_immediate {
             self.wal_append_pending(sql)?;
@@ -5241,6 +5352,15 @@ impl PotatoDB {
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
                 .sum();
+
+            let merges_before = self
+                .validate_constraints_batch(
+                    &table_name,
+                    &target_columns,
+                    &batches,
+                    ConstraintValidationPhase::BeforeInsert,
+                )
+                .await?;
 
             if inserted_rows > 0 {
                 let schema = batches[0].schema();
@@ -5258,53 +5378,71 @@ impl PotatoDB {
                 self.ctx.sql(&insert_sql).await?.collect().await?;
                 let _ = self.ctx.deregister_table(&tmp_name);
 
-                // Update FTS inverted indexes for the new rows
-                let row_offset: usize = match self
-                    .collect_with_plan_cache(&format!("SELECT COUNT(*) FROM \"{table_name}\""))
-                    .await
-                {
-                    Ok(count_batches) => count_batches
-                        .first()
-                        .and_then(|batch| {
-                            batch
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .map(|a| a.value(0) as usize)
-                        })
-                        .map_or(0, |total| total.saturating_sub(inserted_rows)),
-                    Err(_) => 0,
-                };
-                for (idx_name, def) in &self.fulltext_indexes.clone() {
-                    if def.table_name != table_name {
-                        continue;
-                    }
-                    if let Some(idx) = self.fts_inverted_index.get_mut(idx_name) {
-                        let mut row_idx = row_offset;
-                        for batch in &batches {
-                            for row in 0..batch.num_rows() {
-                                let mut text_parts = Vec::new();
-                                for col_name in &def.columns {
-                                    let s = target_columns
-                                        .iter()
-                                        .position(|c| c == col_name)
-                                        .map(|i| {
-                                            array_value_to_string(batch.column(i).as_ref(), row)
-                                        })
-                                        .unwrap_or_default();
-                                    text_parts.push(s);
+                // Update FTS inverted indexes for the new rows (only when this table has FTS).
+                let table_has_fts = self
+                    .fulltext_indexes
+                    .values()
+                    .any(|def| def.table_name == table_name);
+                if table_has_fts {
+                    let row_offset: usize = match self
+                        .collect_with_plan_cache(&format!("SELECT COUNT(*) FROM \"{table_name}\""))
+                        .await
+                    {
+                        Ok(count_batches) => count_batches
+                            .first()
+                            .and_then(|batch| {
+                                batch
+                                    .column(0)
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .map(|a| a.value(0) as usize)
+                            })
+                            .map_or(0, |total| total.saturating_sub(inserted_rows)),
+                        Err(_) => 0,
+                    };
+                    for (idx_name, def) in &self.fulltext_indexes.clone() {
+                        if def.table_name != table_name {
+                            continue;
+                        }
+                        if let Some(idx) = self.fts_inverted_index.get_mut(idx_name) {
+                            let mut row_idx = row_offset;
+                            for batch in &batches {
+                                for row in 0..batch.num_rows() {
+                                    let mut text_parts = Vec::new();
+                                    for col_name in &def.columns {
+                                        let s = target_columns
+                                            .iter()
+                                            .position(|c| c == col_name)
+                                            .map(|i| {
+                                                array_value_to_string(batch.column(i).as_ref(), row)
+                                            })
+                                            .unwrap_or_default();
+                                        text_parts.push(s);
+                                    }
+                                    let text = text_parts.join(" ");
+                                    idx.add_document(&table_name, row_idx, &text);
+                                    row_idx += 1;
                                 }
-                                let text = text_parts.join(" ");
-                                idx.add_document(&table_name, row_idx, &text);
-                                row_idx += 1;
                             }
                         }
                     }
                 }
             }
 
-            self.validate_constraints_batch(&table_name, &target_columns, &batches)
-                .await?;
+            self.validate_constraints_batch(
+                &table_name,
+                &target_columns,
+                &batches,
+                ConstraintValidationPhase::AfterInsert,
+            )
+            .await?;
+
+            if inserted_rows > 0 {
+                for (cache_key, keys) in merges_before {
+                    self.merge_uniqueness_keys(&cache_key, &keys);
+                }
+            }
+
             self.maybe_auto_analyze(&table_name, inserted_rows);
             self.refresh_table_file_stats_light(&table_name).await?;
             self.record_cdc_event(&table_name, "INSERT", inserted_rows);
@@ -5597,7 +5735,8 @@ impl PotatoDB {
                     let df = self.ctx.sql(&rewrite_sql).await?;
                     let schema = Arc::new(df.schema().as_arrow().clone());
                     let modified = df.collect().await?;
-                    self.rewrite_table(&table_name, schema, modified).await?;
+                    self.rewrite_table(&table_name, schema, modified, false)
+                        .await?;
                     updated = update_rows.len();
                 }
             }
@@ -5661,7 +5800,8 @@ impl PotatoDB {
         let old_files = self.list_parquet_files(table_name).await?;
         let file_count = old_files.len();
 
-        self.rewrite_table(table_name, schema, batches).await?;
+        self.rewrite_table(table_name, schema, batches, false)
+            .await?;
         let _ = self.handle_analyze(table_name).await?;
 
         Ok(QueryResult::Message(format!(
@@ -6085,75 +6225,104 @@ impl PotatoDB {
         Ok(())
     }
 
-    /// Checks that none of the `values` already exist in the on-disk table.
-    /// Uses an `IN` clause for single-column keys, and batched OR
-    /// predicates (up to 500 per query) for composite keys to keep
-    /// generated SQL small.
-    async fn check_uniqueness_against_table(
-        &self,
+    fn uniqueness_cache_key_pk(table: &str, columns: &[String]) -> String {
+        format!("pk\x1f{}\x1f{}", table, columns.join("\x1f"))
+    }
+
+    fn uniqueness_cache_key_unique(table: &str, constraint_name: &str) -> String {
+        format!("uq\x1f{table}\x1f{constraint_name}")
+    }
+
+    /// Clears cached PK/UNIQUE key sets for a table (after rewrite, truncate, etc.).
+    fn invalidate_uniqueness_cache_for_table(&mut self, table_name: &str) {
+        let prefix_pk = format!("pk\x1f{table_name}\x1f");
+        let prefix_uq = format!("uq\x1f{table_name}\x1f");
+        self.uniqueness_cache
+            .retain(|k, _| !k.starts_with(&prefix_pk) && !k.starts_with(&prefix_uq));
+    }
+
+    async fn ensure_uniqueness_loaded(
+        &mut self,
+        cache_key: &str,
+        table_name: &str,
+        columns: &[String],
+        skip_null_rows: bool,
+    ) -> Result<(), BoxError> {
+        if self.uniqueness_cache.contains_key(cache_key) {
+            return Ok(());
+        }
+        let cols_sql = columns
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {cols_sql} FROM \"{table_name}\"");
+        let df = self.ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+        let mut set = HashSet::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                let tuple: Vec<String> = (0..columns.len())
+                    .map(|i| array_value_to_sql_literal(batch.column(i).as_ref(), row))
+                    .collect();
+                if skip_null_rows && tuple.iter().any(|v| v == "NULL") {
+                    continue;
+                }
+                set.insert(tuple.join("\x1f"));
+            }
+        }
+        self.uniqueness_cache.insert(cache_key.to_string(), set);
+        Ok(())
+    }
+
+    fn merge_uniqueness_keys(&mut self, cache_key: &str, values: &[Vec<String>]) {
+        let set = self
+            .uniqueness_cache
+            .entry(cache_key.to_string())
+            .or_default();
+        for v in values {
+            set.insert(v.join("\x1f"));
+        }
+    }
+
+    async fn check_uniqueness_against_table_cached(
+        &mut self,
+        cache_key: &str,
         table_name: &str,
         columns: &[String],
         values: &[Vec<String>],
+        skip_null_rows: bool,
         err_msg: &str,
     ) -> Result<(), BoxError> {
-        const BATCH_SIZE: usize = 500;
-
-        if columns.len() == 1 {
-            let col = &columns[0];
-            for chunk in values.chunks(BATCH_SIZE) {
-                let in_list = chunk
-                    .iter()
-                    .map(|v| v[0].as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT COUNT(*) AS c FROM \"{table_name}\" WHERE \"{col}\" IN ({in_list})"
-                );
-                let df = self.ctx.sql(&sql).await?;
-                let out = df.collect().await?;
-                if scalar_count(&out) as usize > chunk.len() {
-                    return Err(err_msg.into());
-                }
-            }
-        } else {
-            for chunk in values.chunks(BATCH_SIZE) {
-                let where_clause = chunk
-                    .iter()
-                    .map(|vals| {
-                        let pred = columns
-                            .iter()
-                            .zip(vals.iter())
-                            .map(|(c, v)| format!("\"{c}\" = {v}"))
-                            .collect::<Vec<_>>()
-                            .join(" AND ");
-                        format!("({pred})")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                let sql =
-                    format!("SELECT COUNT(*) AS c FROM \"{table_name}\" WHERE {where_clause}");
-                let df = self.ctx.sql(&sql).await?;
-                let out = df.collect().await?;
-                if scalar_count(&out) as usize > chunk.len() {
-                    return Err(err_msg.into());
-                }
+        self.ensure_uniqueness_loaded(cache_key, table_name, columns, skip_null_rows)
+            .await?;
+        let set = self
+            .uniqueness_cache
+            .get(cache_key)
+            .expect("ensure_uniqueness_loaded must populate cache");
+        for v in values {
+            let key = v.join("\x1f");
+            if set.contains(&key) {
+                return Err(err_msg.into());
             }
         }
         Ok(())
     }
 
     async fn validate_constraints_batch(
-        &self,
+        &mut self,
         table_name: &str,
         target_columns: &[String],
         batches: &[RecordBatch],
-    ) -> Result<(), BoxError> {
-        if batches.is_empty() {
-            return Ok(());
+        phase: ConstraintValidationPhase,
+    ) -> Result<Vec<(String, Vec<Vec<String>>)>, BoxError> {
+        if batches.is_empty() && matches!(phase, ConstraintValidationPhase::BeforeInsert) {
+            return Ok(Vec::new());
         }
         let Some(meta) = self.catalog.tables.get(table_name) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
+        let constraints = meta.constraints.clone();
 
         let column_positions: HashMap<&str, usize> = target_columns
             .iter()
@@ -6161,14 +6330,22 @@ impl PotatoDB {
             .map(|(i, c)| (c.as_str(), i))
             .collect();
 
-        for constraint in &meta.constraints {
+        let mut merges: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+
+        for constraint in &constraints {
             match constraint {
                 CatalogTableConstraint::PrimaryKey { columns } => {
+                    if !matches!(phase, ConstraintValidationPhase::BeforeInsert) {
+                        continue;
+                    }
                     if columns
                         .iter()
                         .any(|c| !column_positions.contains_key(c.as_str()))
                     {
-                        return self.validate_table_constraints(table_name).await;
+                        return self
+                            .validate_table_constraints(table_name)
+                            .await
+                            .map(|()| Vec::new());
                     }
 
                     let mut seen = HashSet::new();
@@ -6206,21 +6383,31 @@ impl PotatoDB {
                             "PRIMARY KEY violation on '{table_name}' for ({})",
                             columns.join(", ")
                         );
-                        self.check_uniqueness_against_table(
+                        let ck = Self::uniqueness_cache_key_pk(table_name, columns);
+                        self.check_uniqueness_against_table_cached(
+                            &ck,
                             table_name,
                             columns,
                             &values_for_lookup,
+                            false,
                             &err_msg,
                         )
                         .await?;
+                        merges.push((ck, values_for_lookup));
                     }
                 }
                 CatalogTableConstraint::Unique { name, columns } => {
+                    if !matches!(phase, ConstraintValidationPhase::BeforeInsert) {
+                        continue;
+                    }
                     if columns
                         .iter()
                         .any(|c| !column_positions.contains_key(c.as_str()))
                     {
-                        return self.validate_table_constraints(table_name).await;
+                        return self
+                            .validate_table_constraints(table_name)
+                            .await
+                            .map(|()| Vec::new());
                     }
 
                     let mut seen = HashSet::new();
@@ -6251,23 +6438,33 @@ impl PotatoDB {
                     if !values_for_lookup.is_empty() {
                         let err_msg =
                             format!("UNIQUE constraint violation '{name}' on '{table_name}'");
-                        self.check_uniqueness_against_table(
+                        let ck = Self::uniqueness_cache_key_unique(table_name, name);
+                        self.check_uniqueness_against_table_cached(
+                            &ck,
                             table_name,
                             columns,
                             &values_for_lookup,
+                            true,
                             &err_msg,
                         )
                         .await?;
+                        merges.push((ck, values_for_lookup));
                     }
                 }
                 CatalogTableConstraint::Check { name, expr } => {
+                    if !matches!(phase, ConstraintValidationPhase::BeforeInsert) {
+                        continue;
+                    }
                     let non_empty: Vec<&RecordBatch> =
                         batches.iter().filter(|b| b.num_rows() > 0).collect();
                     if non_empty.is_empty() {
                         continue;
                     }
                     if non_empty[0].num_columns() != target_columns.len() {
-                        return self.validate_check_constraints(table_name).await;
+                        return self
+                            .validate_check_constraints(table_name)
+                            .await
+                            .map(|()| Vec::new());
                     }
                     let schema = non_empty[0].schema();
                     let all_batches: Vec<RecordBatch> = non_empty.into_iter().cloned().collect();
@@ -6298,7 +6495,10 @@ impl PotatoDB {
                         scalar_count(&out)
                     } else {
                         let _ = self.ctx.deregister_table(&tmp_name);
-                        return self.validate_check_constraints(table_name).await;
+                        return self
+                            .validate_check_constraints(table_name)
+                            .await
+                            .map(|()| Vec::new());
                     };
                     let _ = self.ctx.deregister_table(&tmp_name);
                     if violating > 0 {
@@ -6315,6 +6515,9 @@ impl PotatoDB {
                     ref_columns,
                     ..
                 } => {
+                    if !matches!(phase, ConstraintValidationPhase::AfterInsert) {
+                        continue;
+                    }
                     if columns.len() != ref_columns.len() || columns.is_empty() {
                         return Err(format!(
                             "FOREIGN KEY '{name}' on '{table_name}' has invalid column mapping"
@@ -6351,7 +6554,7 @@ impl PotatoDB {
                 }
             }
         }
-        Ok(())
+        Ok(merges)
     }
 
     async fn validate_not_null_table(&self, table_name: &str) -> Result<(), BoxError> {
