@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use ratatui::{
+    DefaultTerminal, Frame,
     crossterm::event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
@@ -32,7 +33,6 @@ use ratatui::{
         Block, BorderType, Cell, Clear, HighlightSpacing, List, ListItem, Paragraph, Row,
         Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState,
     },
-    DefaultTerminal, Frame,
 };
 
 use potatodb_engine::{PotatoDB, QueryResult};
@@ -700,10 +700,10 @@ impl App {
     }
 
     fn tick_toast(&mut self) {
-        if let Some(t) = &self.toast {
-            if Instant::now() >= t.expires {
-                self.toast = None;
-            }
+        if let Some(t) = &self.toast
+            && Instant::now() >= t.expires
+        {
+            self.toast = None;
         }
     }
 

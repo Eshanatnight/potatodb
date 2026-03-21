@@ -1,5 +1,6 @@
 #![allow(
     non_camel_case_types,
+    unsafe_op_in_unsafe_fn,
     clippy::items_after_statements,
     clippy::manual_let_else,
     clippy::option_if_let_else,
@@ -220,7 +221,7 @@ fn arrow_value_to_string(arr: &dyn Array, index: usize) -> Option<String> {
 /// Any non-NULL pointer argument must be valid for reads for the duration of
 /// this call. Handle pointers returned by this API must later be released with
 /// their corresponding free/close function and not used afterwards.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_open(
     data_dir: *const c_char,
     s3_endpoint: *const c_char,
@@ -267,7 +268,7 @@ pub unsafe extern "C" fn potato_open(
 /// Any non-NULL pointer argument must be valid for reads for the duration of
 /// this call. Handle pointers returned by this API must later be released with
 /// their corresponding free/close function and not used afterwards.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_open_local(data_dir: *const c_char) -> *mut potato_db {
     potato_open(data_dir, ptr::null(), ptr::null(), false, ptr::null())
 }
@@ -277,7 +278,7 @@ pub unsafe extern "C" fn potato_open_local(data_dir: *const c_char) -> *mut pota
 /// # Safety
 /// `db` must either be NULL or a pointer previously returned by
 /// `potato_open`/`potato_open_local` that has not already been closed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_close(db: *mut potato_db) {
     if !db.is_null() {
         drop(Box::from_raw(db));
@@ -291,7 +292,7 @@ pub unsafe extern "C" fn potato_close(db: *mut potato_db) {
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library that
 /// remains alive for the duration of this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_last_error(db: *const potato_db) -> *const c_char {
     if db.is_null() {
         return ptr::null();
@@ -310,7 +311,7 @@ pub unsafe extern "C" fn potato_last_error(db: *const potato_db) -> *const c_cha
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_in_transaction(db: *const potato_db) -> bool {
     if db.is_null() {
         return false;
@@ -325,7 +326,7 @@ pub const unsafe extern "C" fn potato_in_transaction(db: *const potato_db) -> bo
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_data_url(db: *const potato_db) -> *mut c_char {
     if db.is_null() {
         return ptr::null_mut();
@@ -343,7 +344,7 @@ pub unsafe extern "C" fn potato_data_url(db: *const potato_db) -> *mut c_char {
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_table_names(db: *const potato_db) -> *mut potato_string_list {
     if db.is_null() {
         return ptr::null_mut();
@@ -364,7 +365,7 @@ pub unsafe extern "C" fn potato_table_names(db: *const potato_db) -> *mut potato
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library, and
 /// `table_name` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_table_columns(
     db: *const potato_db,
     table_name: *const c_char,
@@ -391,7 +392,7 @@ pub unsafe extern "C" fn potato_table_columns(
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_view_names(db: *const potato_db) -> *mut potato_string_list {
     if db.is_null() {
         return ptr::null_mut();
@@ -411,7 +412,7 @@ pub unsafe extern "C" fn potato_view_names(db: *const potato_db) -> *mut potato_
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_function_names(db: *const potato_db) -> *mut potato_string_list {
     if db.is_null() {
         return ptr::null_mut();
@@ -431,7 +432,7 @@ pub unsafe extern "C" fn potato_function_names(db: *const potato_db) -> *mut pot
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_indexes(db: *const potato_db) -> *mut potato_index_list {
     if db.is_null() {
         return ptr::null_mut();
@@ -456,7 +457,7 @@ pub unsafe extern "C" fn potato_indexes(db: *const potato_db) -> *mut potato_ind
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_string_list_count(list: *const potato_string_list) -> usize {
     if list.is_null() {
         return 0;
@@ -470,7 +471,7 @@ pub const unsafe extern "C" fn potato_string_list_count(list: *const potato_stri
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_string_list_get(
     list: *const potato_string_list,
     index: usize,
@@ -490,7 +491,7 @@ pub unsafe extern "C" fn potato_string_list_get(
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library
 /// that has not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_string_list_free(list: *mut potato_string_list) {
     if !list.is_null() {
         drop(Box::from_raw(list));
@@ -505,7 +506,7 @@ pub unsafe extern "C" fn potato_string_list_free(list: *mut potato_string_list) 
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_index_list_count(list: *const potato_index_list) -> usize {
     if list.is_null() {
         return 0;
@@ -519,7 +520,7 @@ pub const unsafe extern "C" fn potato_index_list_count(list: *const potato_index
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_index_list_name(
     list: *const potato_index_list,
     index: usize,
@@ -541,7 +542,7 @@ pub unsafe extern "C" fn potato_index_list_name(
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_index_list_table(
     list: *const potato_index_list,
     index: usize,
@@ -561,7 +562,7 @@ pub unsafe extern "C" fn potato_index_list_table(
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library
 /// that has not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_index_list_free(list: *mut potato_index_list) {
     if !list.is_null() {
         drop(Box::from_raw(list));
@@ -580,7 +581,7 @@ pub unsafe extern "C" fn potato_index_list_free(list: *mut potato_index_list) {
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and `sql`
 /// must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_execute(
     db: *mut potato_db,
     sql: *const c_char,
@@ -615,7 +616,7 @@ pub unsafe extern "C" fn potato_execute(
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and `sql`
 /// must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_execute_readonly(
     db: *mut potato_db,
     sql: *const c_char,
@@ -657,7 +658,7 @@ pub unsafe extern "C" fn potato_execute_readonly(
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `path` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_execute_file(
     db: *mut potato_db,
     path: *const c_char,
@@ -716,7 +717,7 @@ pub unsafe extern "C" fn potato_execute_file(
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_result_list_count(list: *const potato_result_list) -> usize {
     if list.is_null() {
         return 0;
@@ -730,7 +731,7 @@ pub const unsafe extern "C" fn potato_result_list_count(list: *const potato_resu
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_list_sql(
     list: *const potato_result_list,
     index: usize,
@@ -753,7 +754,7 @@ pub unsafe extern "C" fn potato_result_list_sql(
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_list_result(
     list: *const potato_result_list,
     index: usize,
@@ -778,7 +779,7 @@ pub unsafe extern "C" fn potato_result_list_result(
 ///
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_list_error(
     list: *const potato_result_list,
     index: usize,
@@ -801,7 +802,7 @@ pub unsafe extern "C" fn potato_result_list_error(
 /// # Safety
 /// `list` must either be NULL or a valid pointer returned by this library
 /// that has not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_list_free(list: *mut potato_result_list) {
     if !list.is_null() {
         drop(Box::from_raw(list));
@@ -819,7 +820,7 @@ pub unsafe extern "C" fn potato_result_list_free(list: *mut potato_result_list) 
 ///
 /// # Safety
 /// `db` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_recent_queries(db: *const potato_db) -> *mut potato_query_log {
     if db.is_null() {
         return ptr::null_mut();
@@ -844,7 +845,7 @@ pub unsafe extern "C" fn potato_recent_queries(db: *const potato_db) -> *mut pot
 /// # Safety
 /// `db` must either be NULL or a valid mutable pointer returned by this
 /// library that has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_recent_cdc(db: *mut potato_db) -> *mut potato_result {
     if db.is_null() {
         return ptr::null_mut();
@@ -869,7 +870,7 @@ pub unsafe extern "C" fn potato_recent_cdc(db: *mut potato_db) -> *mut potato_re
 ///
 /// # Safety
 /// `log` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_query_log_count(log: *const potato_query_log) -> usize {
     if log.is_null() {
         return 0;
@@ -883,7 +884,7 @@ pub const unsafe extern "C" fn potato_query_log_count(log: *const potato_query_l
 ///
 /// # Safety
 /// `log` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_query_log_sql(
     log: *const potato_query_log,
     index: usize,
@@ -904,7 +905,7 @@ pub unsafe extern "C" fn potato_query_log_sql(
 ///
 /// # Safety
 /// `log` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_query_log_duration_ms(
     log: *const potato_query_log,
     index: usize,
@@ -925,7 +926,7 @@ pub unsafe extern "C" fn potato_query_log_duration_ms(
 ///
 /// # Safety
 /// `log` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_query_log_rows(
     log: *const potato_query_log,
     index: usize,
@@ -945,7 +946,7 @@ pub unsafe extern "C" fn potato_query_log_rows(
 /// # Safety
 /// `log` must either be NULL or a valid pointer returned by this library
 /// that has not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_query_log_free(log: *mut potato_query_log) {
     if !log.is_null() {
         drop(Box::from_raw(log));
@@ -963,7 +964,7 @@ pub unsafe extern "C" fn potato_query_log_free(log: *mut potato_query_log) {
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `archive_path` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_backup(db: *mut potato_db, archive_path: *const c_char) -> i32 {
     if db.is_null() {
         return -1;
@@ -994,7 +995,7 @@ pub unsafe extern "C" fn potato_backup(db: *mut potato_db, archive_path: *const 
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `archive_path` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_restore(db: *mut potato_db, archive_path: *const c_char) -> i32 {
     if db.is_null() {
         return -1;
@@ -1028,7 +1029,7 @@ pub unsafe extern "C" fn potato_restore(db: *mut potato_db, archive_path: *const
 ///
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_flush(db: *mut potato_db) -> i32 {
     if db.is_null() {
         return -1;
@@ -1051,7 +1052,7 @@ pub unsafe extern "C" fn potato_flush(db: *mut potato_db) -> i32 {
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `table_name` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_flush_table(db: *mut potato_db, table_name: *const c_char) -> i32 {
     if db.is_null() {
         return -1;
@@ -1090,7 +1091,7 @@ pub unsafe extern "C" fn potato_flush_table(db: *mut potato_db, table_name: *con
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `table_name` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_table_parquet_file_count(
     db: *mut potato_db,
     table_name: *const c_char,
@@ -1133,7 +1134,7 @@ pub unsafe extern "C" fn potato_table_parquet_file_count(
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `table_name` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_table_total_bytes(
     db: *mut potato_db,
     table_name: *const c_char,
@@ -1176,7 +1177,7 @@ pub unsafe extern "C" fn potato_table_total_bytes(
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and
 /// `table_name` must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_table_oldest_file_age_secs(
     db: *mut potato_db,
     table_name: *const c_char,
@@ -1221,7 +1222,7 @@ pub unsafe extern "C" fn potato_table_oldest_file_age_secs(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_result_get_kind(
     res: *const potato_result,
 ) -> potato_result_kind {
@@ -1238,7 +1239,7 @@ pub const unsafe extern "C" fn potato_result_get_kind(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_message(res: *const potato_result) -> *const c_char {
     if res.is_null() {
         return ptr::null();
@@ -1254,7 +1255,7 @@ pub unsafe extern "C" fn potato_result_message(res: *const potato_result) -> *co
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_result_row_count(res: *const potato_result) -> usize {
     if res.is_null() {
         return 0;
@@ -1267,7 +1268,7 @@ pub const unsafe extern "C" fn potato_result_row_count(res: *const potato_result
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_column_count(res: *const potato_result) -> usize {
     if res.is_null() {
         return 0;
@@ -1285,7 +1286,7 @@ pub unsafe extern "C" fn potato_result_column_count(res: *const potato_result) -
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_column_name(
     res: *const potato_result,
     col_idx: usize,
@@ -1305,7 +1306,7 @@ pub unsafe extern "C" fn potato_result_column_name(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_column_type(
     res: *const potato_result,
     col_idx: usize,
@@ -1365,7 +1366,7 @@ pub unsafe extern "C" fn potato_result_get_column_type(
 /// # Safety
 /// `res` must either be NULL or a valid mutable pointer returned by this
 /// library that has not been freed and is not concurrently aliased.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_display(res: *mut potato_result) -> *const c_char {
     if res.is_null() {
         return ptr::null();
@@ -1394,7 +1395,7 @@ pub unsafe extern "C" fn potato_result_display(res: *mut potato_result) -> *cons
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_is_null(
     res: *const potato_result,
     row: usize,
@@ -1419,7 +1420,7 @@ pub unsafe extern "C" fn potato_result_is_null(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_int(
     res: *const potato_result,
     row: usize,
@@ -1429,8 +1430,8 @@ pub unsafe extern "C" fn potato_result_get_int(
         return 0;
     }
     use arrow::array::{
-        Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
+        Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     };
     let (batch, local_row) = match resolve_row(&(*res).batches, row) {
         Some(v) => v,
@@ -1475,7 +1476,7 @@ pub unsafe extern "C" fn potato_result_get_int(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_double(
     res: *const potato_result,
     row: usize,
@@ -1510,7 +1511,7 @@ pub unsafe extern "C" fn potato_result_get_double(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_bool(
     res: *const potato_result,
     row: usize,
@@ -1542,7 +1543,7 @@ pub unsafe extern "C" fn potato_result_get_bool(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_date(
     res: *const potato_result,
     row: usize,
@@ -1579,7 +1580,7 @@ pub unsafe extern "C" fn potato_result_get_date(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_timestamp(
     res: *const potato_result,
     row: usize,
@@ -1628,7 +1629,7 @@ pub unsafe extern "C" fn potato_result_get_timestamp(
 /// # Safety
 /// `res` must either be NULL or a valid pointer returned by this library that
 /// has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_get_string(
     res: *const potato_result,
     row: usize,
@@ -1676,7 +1677,7 @@ pub unsafe extern "C" fn potato_result_get_string(
 /// # Safety
 /// `s` must either be NULL or a pointer returned by `CString::into_raw` from
 /// this library (such as `potato_result_get_string`) that has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_string_free(s: *mut c_char) {
     if !s.is_null() {
         drop(CString::from_raw(s));
@@ -1688,7 +1689,7 @@ pub unsafe extern "C" fn potato_string_free(s: *mut c_char) {
 /// # Safety
 /// `res` must either be NULL or a pointer returned by this library that has
 /// not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_result_free(res: *mut potato_result) {
     if !res.is_null() {
         drop(Box::from_raw(res));
@@ -1706,7 +1707,7 @@ pub unsafe extern "C" fn potato_result_free(res: *mut potato_result) {
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and `name`
 /// and `sql` must be non-NULL valid NUL-terminated strings.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_prepare(
     db: *mut potato_db,
     name: *const c_char,
@@ -1747,7 +1748,7 @@ pub unsafe extern "C" fn potato_prepare(
 /// `params` is an array of `param_count` C strings.  Each is substituted
 /// for `$1`, `$2`, … in the prepared SQL.
 /// Returns a result handle on success, or NULL on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_execute_prepared(
     db: *mut potato_db,
     name: *const c_char,
@@ -1813,7 +1814,7 @@ pub unsafe extern "C" fn potato_execute_prepared(
 /// # Safety
 /// `db` must be a valid mutable handle pointer from this library, and `sql`
 /// must be a non-NULL valid NUL-terminated string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_execute_stream(
     db: *mut potato_db,
     sql: *const c_char,
@@ -1867,7 +1868,7 @@ pub unsafe extern "C" fn potato_execute_stream(
 /// `stream` must be a valid mutable pointer returned by
 /// `potato_execute_stream` that has not been freed. The `potato_db`
 /// that created the stream must still be alive.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_stream_next(stream: *mut potato_stream) -> *mut potato_result {
     if stream.is_null() {
         return ptr::null_mut();
@@ -1876,7 +1877,7 @@ pub unsafe extern "C" fn potato_stream_next(stream: *mut potato_stream) -> *mut 
     let rt = &*stream.rt;
 
     match &mut stream.inner {
-        StreamInner::Stream(ref mut s) => {
+        StreamInner::Stream(s) => {
             if let Some(Ok(batch)) = rt.block_on(s.next()) {
                 let row_count = batch.num_rows();
                 let column_names = collect_column_names(std::slice::from_ref(&batch));
@@ -1902,7 +1903,7 @@ pub unsafe extern "C" fn potato_stream_next(stream: *mut potato_stream) -> *mut 
 ///
 /// # Safety
 /// `stream` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub const unsafe extern "C" fn potato_stream_is_message(stream: *const potato_stream) -> bool {
     if stream.is_null() {
         return false;
@@ -1916,7 +1917,7 @@ pub const unsafe extern "C" fn potato_stream_is_message(stream: *const potato_st
 ///
 /// # Safety
 /// `stream` must either be NULL or a valid pointer returned by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_stream_message(stream: *const potato_stream) -> *const c_char {
     if stream.is_null() {
         return ptr::null();
@@ -1932,7 +1933,7 @@ pub unsafe extern "C" fn potato_stream_message(stream: *const potato_stream) -> 
 /// # Safety
 /// `stream` must either be NULL or a valid pointer returned by
 /// `potato_execute_stream` that has not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn potato_stream_free(stream: *mut potato_stream) {
     if !stream.is_null() {
         drop(Box::from_raw(stream));

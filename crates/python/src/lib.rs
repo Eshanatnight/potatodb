@@ -8,10 +8,10 @@ use arrow::array::{
     TimestampSecondArray,
 };
 use futures::StreamExt;
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use pyo3::IntoPyObjectExt;
 use tokio::runtime::Runtime;
 
 use potatodb_engine::{PotatoDB, QueryResult, QueryResultStream, S3Config};

@@ -8,18 +8,18 @@ pub fn normalize_explain_sql(sql: &str) -> String {
     if upper.starts_with("EXPLAIN (") {
         let open_idx = trimmed.find('(');
         let close_idx = trimmed.find(')');
-        if let (Some(open), Some(close)) = (open_idx, close_idx) {
-            if close > open {
-                let opts = upper[open + 1..close].trim();
-                let has_analyze = opts.split(',').any(|o| o.trim() == "ANALYZE");
-                let rest = trimmed[close + 1..].trim();
-                if !rest.is_empty() {
-                    return if has_analyze {
-                        format!("EXPLAIN ANALYZE {rest}")
-                    } else {
-                        format!("EXPLAIN {rest}")
-                    };
-                }
+        if let (Some(open), Some(close)) = (open_idx, close_idx)
+            && close > open
+        {
+            let opts = upper[open + 1..close].trim();
+            let has_analyze = opts.split(',').any(|o| o.trim() == "ANALYZE");
+            let rest = trimmed[close + 1..].trim();
+            if !rest.is_empty() {
+                return if has_analyze {
+                    format!("EXPLAIN ANALYZE {rest}")
+                } else {
+                    format!("EXPLAIN {rest}")
+                };
             }
         }
     }

@@ -666,15 +666,15 @@ impl Catalog {
 
         let next = seq.current_value;
         let advanced = seq.current_value.saturating_add(seq.increment);
-        if let Some(min) = seq.min_value {
-            if advanced < min {
-                return Err(format!("Sequence '{name}' reached minimum value").into());
-            }
+        if let Some(min) = seq.min_value
+            && advanced < min
+        {
+            return Err(format!("Sequence '{name}' reached minimum value").into());
         }
-        if let Some(max) = seq.max_value {
-            if advanced > max {
-                return Err(format!("Sequence '{name}' reached maximum value").into());
-            }
+        if let Some(max) = seq.max_value
+            && advanced > max
+        {
+            return Err(format!("Sequence '{name}' reached maximum value").into());
         }
         seq.current_value = advanced;
         self.save().await?;

@@ -5,7 +5,7 @@
 /// Run with:
 ///   cargo run --example constraints
 use potatodb_engine::PotatoDB;
-use potatodb_examples::{print_result, section, BoxError};
+use potatodb_examples::{BoxError, print_result, section};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {

@@ -2,3 +2,6 @@
 # Not set here because target-cpu=native causes SIGILL on CI (GitHub Actions runners).
 # [build]
 # rustflags = ["-C", "target-cpu=native"]
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "26.0"

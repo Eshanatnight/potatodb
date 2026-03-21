@@ -58,7 +58,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
-        std::env::set_var("MIMALLOC_PURGE_DELAY", "10");
+        unsafe { std::env::set_var("MIMALLOC_PURGE_DELAY", "10") };
     }
 
     let cli = Cli::parse();
