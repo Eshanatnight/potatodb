@@ -4,8 +4,14 @@ description = "A Parquet-backed SQL database powered by DataFusion"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["use-mimalloc"]
+use-mimalloc = ["dep:mimalloc"]
+use-jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
 potatodb-engine.workspace = true
 potatodb-display.workspace = true
 potatodb-repl.workspace = true

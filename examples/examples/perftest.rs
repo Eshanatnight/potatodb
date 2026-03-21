@@ -7,11 +7,33 @@
 ///
 /// Usage:
 ///   cargo run --release --example perftest
+///   cargo run --release --example perftest --features use-jemalloc --no-default-features
 ///   cargo run --release --example perftest -- --save results.json
 ///   cargo run --release --example perftest -- --baseline results.json
 ///   cargo run --release --example perftest -- --baseline old.json --save new.json
 ///   cargo run --release --example perftest -- --scale 2     # 2x data
 ///   cargo run --release --example perftest -- --iterations 7
+#[cfg(all(feature = "use-mimalloc", feature = "use-jemalloc"))]
+compile_error!(
+    "Enable only one allocator: use default `use-mimalloc`, or `jemalloc` with \
+     `--no-default-features --features use-jemalloc` on the `potatodb-examples` crate."
+);
+
+#[cfg(all(feature = "use-mimalloc", not(feature = "use-jemalloc")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(not(feature = "use-mimalloc"), feature = "use-jemalloc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "use-mimalloc", not(feature = "use-jemalloc")))]
+const ALLOCATOR_NAME: &str = "mimalloc";
+#[cfg(all(not(feature = "use-mimalloc"), feature = "use-jemalloc"))]
+const ALLOCATOR_NAME: &str = "jemalloc";
+#[cfg(not(any(feature = "use-mimalloc", feature = "use-jemalloc")))]
+const ALLOCATOR_NAME: &str = "system";
+
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -748,6 +770,7 @@ async fn main() -> Result<(), BoxError> {
     let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None).await?;
 
     eprintln!("PotatoDB Performance Test");
+    eprintln!("  allocator:  {}", ALLOCATOR_NAME);
     eprintln!("  scale:      {}x", args.scale);
     eprintln!("  iterations: {}", args.iterations);
     eprintln!();
@@ -826,6 +849,7 @@ async fn main() -> Result<(), BoxError> {
 
     let report = serde_json::json!({
         "tool": "potatodb-perftest",
+        "allocator": ALLOCATOR_NAME,
         "timestamp_unix": unix_timestamp_secs(),
         "scale": args.scale,
         "iterations": args.iterations,

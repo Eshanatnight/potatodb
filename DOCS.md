@@ -31,7 +31,7 @@ Recent engine extensions include:
 - deferred auto-analyze (moved off the insert hot path)
 - buffered Arrow WAL writes with fdatasync and directory caching
 - approximate distinct counts (`APPROX_DISTINCT`) in `ANALYZE`
-- mimalloc purge-delay tuning for reduced `madvise` overhead
+- mimalloc (default) or optional jemalloc (`use-jemalloc` feature) for the `potatodb` binary and `perftest`; mimalloc purge-delay tuning for reduced `madvise` overhead
 - end-to-end performance test suite (`perftest`) with JSON reporting and baseline comparison
 
 ---
@@ -593,7 +593,39 @@ A `CMakeLists.txt` is provided in `crates/ffi/` for CMake integration.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MIMALLOC_PURGE_DELAY` | `10` | Seconds before mimalloc returns memory to the OS (set automatically at startup if unset) |
+| `MIMALLOC_PURGE_DELAY` | `10` | Seconds before mimalloc returns memory to the OS (set automatically at startup if unset, mimalloc builds only) |
+
+#### Build-time allocator selection (`potatodb` binary and `perftest` example)
+
+The workspace uses Cargo features to pick a global allocator at **compile** time:
+
+| Feature | Default | Effect |
+|---------|---------|--------|
+| `use-mimalloc` | yes | [mimalloc](https://github.com/microsoft/mimalloc) via `mimalloc` crate |
+| `use-jemalloc` | no | [jemalloc](https://jemalloc.net/) via `tikv-jemallocator` (Unix only: Linux, macOS, BSD) |
+
+The default feature set is `use-mimalloc`. To build with jemalloc, disable defaults and enable `use-jemalloc` (do not combine both features):
+
+```bash
+# Main binary
+cargo build -p potatodb --release --no-default-features --features use-jemalloc
+
+# End-to-end perf suite under jemalloc
+cargo run --release --example perftest --no-default-features --features use-jemalloc
+```
+
+Compare mimalloc vs jemalloc with the same workload (writes JSON under `perf_mimalloc.json` / `perf_jemalloc.json` and prints a baseline diff for the jemalloc run):
+
+```bash
+make perf-alloc-compare
+# Tune: PERF_SCALE=2 PERF_ITERS=7 make perf-alloc-compare
+```
+
+Individual saves: `make perf-mimalloc`, `make perf-jemalloc`.
+
+`perftest` JSON output includes an `"allocator"` field (`"mimalloc"`, `"jemalloc"`, or `"system"` if neither feature is enabled).
+
+**Windows:** `tikv-jemallocator` does not support Windows. Release builds on Windows should keep the default `use-mimalloc` (or omit custom allocators with `--no-default-features` and no allocator feature, which uses the system allocator).
 
 ### Server
 

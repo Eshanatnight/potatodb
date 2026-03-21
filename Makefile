@@ -1,6 +1,6 @@
 .PHONY: all help build check clippy-full clippy-base clippy clippy-fix fmt fmt-check clean test \
        rust-test bench bench-html release run run-repl run-release doc ffi ffi-example ffi-test \
-       python-test package perftest perf-save perf-compare
+       python-test package perftest perf-save perf-compare perf-mimalloc perf-jemalloc perf-alloc-compare
 
 all: fmt clippy test build
 
@@ -39,6 +39,12 @@ help:
 	@echo "  ffi-example     Build C++ FFI example binary"
 	@echo "  ffi-test        Build and run C++ FFI unit tests (doctest)"
 	@echo "  python-test     Build and run Python binding tests (uv + pytest)"
+	@echo "  perftest        Run performance test suite (release mode)"
+	@echo "  perf-mimalloc   Run perftest with mimalloc, save to perf_mimalloc.json"
+	@echo "  perf-jemalloc   Run perftest with jemalloc, save to perf_jemalloc.json"
+	@echo "  perf-alloc-compare  Run mimalloc then jemalloc vs mimalloc baseline (Unix)"
+	@echo "  perf-save       Run perf test and save baseline to PERF_BASELINE"
+	@echo "  perf-compare    Run perf test and compare against PERF_BASELINE"
 	@echo "                  Tune with PERF_SCALE=N PERF_ITERS=N PERF_BASELINE=file.json"
 	@echo "  package         Create a .tar.gz package in dist/"
 	@echo "                  Override with PACKAGE_DIR/PACKAGE_NAME/PACKAGE_VERSION/PACKAGE_FILE"
@@ -113,6 +119,19 @@ perf-save:
 perf-compare:
 	cargo run --release --example perftest -- --scale $(PERF_SCALE) --iterations $(PERF_ITERS) \
 		--baseline $(PERF_BASELINE)
+
+perf-mimalloc:
+	cargo run --release --example perftest --features use-mimalloc --no-default-features \
+		-- --scale $(PERF_SCALE) --iterations $(PERF_ITERS) --save perf_mimalloc.json
+
+perf-jemalloc:
+	cargo run --release --example perftest --features use-jemalloc --no-default-features \
+		-- --scale $(PERF_SCALE) --iterations $(PERF_ITERS) --save perf_jemalloc.json
+
+perf-alloc-compare: perf-mimalloc
+	cargo run --release --example perftest --features use-jemalloc --no-default-features \
+		-- --baseline perf_mimalloc.json --save perf_jemalloc.json \
+		--scale $(PERF_SCALE) --iterations $(PERF_ITERS)
 
 # ── Run ──────────────────────────────────────────────────────
 
