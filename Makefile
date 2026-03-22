@@ -106,8 +106,8 @@ bench-html: bench
 	@echo "  target/criterion/report/index.html"
 
 PERF_BASELINE ?= perf_baseline.json
-PERF_SCALE ?= 1
-PERF_ITERS ?= 5
+PERF_SCALE ?= 100
+PERF_ITERS ?= 10000
 
 perftest:
 	cargo run --release --example perftest -- --scale $(PERF_SCALE) --iterations $(PERF_ITERS)

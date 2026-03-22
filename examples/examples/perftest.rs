@@ -765,11 +765,13 @@ fn print_comparison(current: &BTreeMap<String, BenchResult>, baseline: &serde_js
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    eprintln!("PotatoDB Performance Test");
     let args = parse_args();
     let tmp = tempfile::tempdir()?;
-    let mut db = PotatoDB::new(tmp.path().to_string_lossy().to_string(), None).await?;
+    let path = tmp.path().to_string_lossy().to_string();
+    eprintln!("  path: {}", &path);
+    let mut db = PotatoDB::new(path, None).await?;
 
-    eprintln!("PotatoDB Performance Test");
     eprintln!("  allocator:  {}", ALLOCATOR_NAME);
     eprintln!("  scale:      {}x", args.scale);
     eprintln!("  iterations: {}", args.iterations);
