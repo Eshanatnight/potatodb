@@ -44,6 +44,7 @@ async-recursion = "1"
 async-trait = "0.1"
 crc32fast = "1"
 mimalloc = "0.1"
+tikv-jemallocator = "0.6"
 
 potatodb-catalog = { path = "crates/catalog" }
 potatodb-display = { path = "crates/display" }

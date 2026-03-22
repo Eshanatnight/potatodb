@@ -1,15 +1,25 @@
+#[cfg(all(feature = "use-mimalloc", feature = "use-jemalloc"))]
+compile_error!(
+    "Enable only one allocator: use default `use-mimalloc`, or `jemalloc` with \
+     `--no-default-features --features use-jemalloc` on the `potatodb` crate."
+);
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
-use mimalloc::MiMalloc;
 use potatodb_engine::{QueryResult, S3Config};
 use tokio::sync::RwLock;
 
 use potatodb_tui::ThemeChoice;
 
+#[cfg(all(feature = "use-mimalloc", not(feature = "use-jemalloc")))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(not(feature = "use-mimalloc"), feature = "use-jemalloc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser)]
 #[command(name = "potatodb", about = "A Parquet-backed SQL database")]
@@ -57,6 +67,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(all(feature = "use-mimalloc", not(feature = "use-jemalloc")))]
     if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
         unsafe { std::env::set_var("MIMALLOC_PURGE_DELAY", "10") };
     }
