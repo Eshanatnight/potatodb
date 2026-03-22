@@ -76,20 +76,25 @@ typedef enum
 /**
  * Opens a database.
  *
- * @param data_dir      Local path or `s3://bucket/prefix` URL (required).
+ * @param data_dir      Local path, `s3://bucket/prefix`, `:memory:` / `memory`, or
+ *                      `memory://host/optional/prefix` (required). S3 options apply
+ *                      only when `data_dir` starts with `s3://`.
  * @param s3_endpoint   S3-compatible endpoint URL, or NULL for AWS default.
  * @param s3_region     AWS region string, or NULL for default.
  * @param s3_allow_http Set to `true` to allow plain HTTP connections.
- * @param wal_dir       Local directory for write-ahead log files. or null for default.
+ * @param wal_dir       Local directory for write-ahead log files, or NULL for default.
  * @return Handle on success, NULL on failure.
  */
 potato_db* potato_open(
     const char* data_dir, const char* s3_endpoint, const char* s3_region, bool s3_allow_http, const char* wal_dir);
 
 /**
- * Opens a local database (convenience — no S3 parameters).
+ * Opens a database (convenience — no S3 parameters).
  *
- * @param data_dir Local filesystem path.
+ * Same path rules as `potato_open`: local directory, in-memory (`:memory:`,
+ * `memory://...`), etc. Use `potato_open` when opening S3 with endpoint/region.
+ *
+ * @param data_dir Storage location string.
  * @return Handle on success, NULL on failure.
  */
 potato_db* potato_open_local(const char* data_dir);
@@ -114,7 +119,7 @@ const char* potato_last_error(const potato_db* db);
 bool potato_in_transaction(const potato_db* db);
 
 /**
- * Returns the data directory / URL for the database.
+ * Returns the canonical data directory or URL (local path, `s3://...`, `memory://...`).
  *
  * @return Heap-allocated string; free with `potato_string_free`.
  */

@@ -9,6 +9,7 @@ A Parquet-backed SQL database written in Rust, powered by [Apache DataFusion](ht
 
 - **Parquet-native SQL engine** -- DataFusion-powered query execution over Zstd-compressed Parquet with bloom/page pruning
 - **Local + S3 durability** -- local binary WAL (buffered with fdatasync) and S3-backed WAL metadata replay for crash recovery
+- **In-memory mode** -- `:memory:` / `memory://...` uses an in-memory object store (Parquet + catalog in RAM; no WAL, no crash recovery, no backup/restore)
 - **Transactions with destructive rewrites** -- `UPDATE`, `DELETE`, `CREATE INDEX`, and `VACUUM` now work inside `BEGIN` / `COMMIT` / `ROLLBACK`
 - **Time travel queries** -- `AS OF TIMESTAMP` reads from captured snapshots
 - **Indexing options** -- multiple index metadata per table (primary + logical), plus `CREATE FULLTEXT INDEX` and `fts_match(...)`
@@ -61,6 +62,24 @@ cargo run -- \
   --s3-region us-east-1 \
   --s3-allow-http
 ```
+
+## In-memory storage
+
+Point `--data-dir` at an in-memory URL. All catalog and table data live in
+process memory (`object_store::memory::InMemory`); nothing is written to disk.
+
+```bash
+# SQLite-style alias (default bucket name `potatodb`)
+cargo run -- --data-dir :memory:
+
+# Explicit URL: optional host and optional key prefix (like S3 path prefix)
+cargo run -- --data-dir 'memory://potatodb'
+cargo run -- --data-dir 'memory://myhost/my/prefix'
+```
+
+**Limitations:** no WAL or startup replay, no CDC file, and `backup` / `restore`
+(FFI and engine API) are not supported—same as S3. Use for tests, scratch work,
+or ad hoc sessions.
 
 ## SQL reference
 
@@ -507,7 +526,7 @@ potatodb-python ── potatodb-engine
 | ------------------ | ------------------------------------------------------------------------------- |
 | `potatodb-catalog` | Persistent JSON catalog with snapshot/restore for MVCC transactions             |
 | `potatodb-display` | Formats Arrow `RecordBatch` results as ASCII tables                             |
-| `potatodb-engine`  | Core engine: DDL, DML, transactions, DataFusion SessionContext, Parquet I/O, S3 |
+| `potatodb-engine`  | Core engine: DDL, DML, transactions, DataFusion SessionContext, Parquet I/O, S3, in-memory |
 | `potatodb-ffi`     | C/C++ FFI bindings (static + shared library, C header, C++ RAII wrapper)        |
 | `potatodb-repl`    | Line-mode interactive SQL shell with readline and history                       |
 | `potatodb-tui`     | Full-screen ratatui terminal UI with scrollable results and sidebar             |
@@ -519,14 +538,14 @@ potatodb-python ── potatodb-engine
 
 ### How it works
 
-1. **`CREATE TABLE`** creates a storage directory (local) or prefix (S3) and registers a DataFusion `ListingTable` that reads/writes Parquet files from that location.
+1. **`CREATE TABLE`** creates a storage directory (local), prefix (S3), or in-memory object prefix and registers a DataFusion `ListingTable` that reads/writes Parquet files from that location.
 2. **`INSERT INTO`** is either buffered in-memory (flush by thresholds) or written directly for constrained / returning paths.
 3. **`SELECT`** queries are planned and executed by DataFusion with full predicate pushdown, bloom filter pruning, and page-index pruning against the Parquet files.
 4. **`CREATE INDEX`** reads all data sorted by the indexed columns, rewrites the Parquet files in sorted order, and registers a sort-order hint with DataFusion so it can skip row groups and avoid redundant sorts.
 5. **`DROP TABLE`** deregisters from DataFusion, deletes all Parquet files (via `ObjectStore`), and removes the table and its indexes from the catalog.
 6. **`BEGIN` / `COMMIT` / `ROLLBACK`** provide atomic multi-statement transactions via file-level MVCC: the catalog is snapshotted at `BEGIN`, mutations are held in memory, and `ROLLBACK` deletes new files and restores the snapshot.
-7. The **catalog** (`catalog.json`) is persisted through the `ObjectStore` trait, making it work identically for local filesystems and S3.
-8. For local storage, the **WAL** (`wal.log`) is replayed on startup to recover committed statements after crashes.
+7. The **catalog** (`catalog.json`) is persisted through the `ObjectStore` trait, making it work identically for local filesystems, S3, and the in-memory object store.
+8. For local storage, the **WAL** (`wal.log`) is replayed on startup to recover committed statements after crashes. In-memory mode skips the WAL and Arrow WAL entirely.
 
 ### Performance
 
@@ -605,6 +624,8 @@ if (!db) {
     std::cerr << db.error() << "\n";
     return 1;
 }
+
+// In-memory (ephemeral): `potato::Database::open(":memory:")` or `memory://...`
 
 // S3 storage
 auto db = potato::Database::open_s3(
@@ -729,6 +750,7 @@ Then use from Python:
 from potatodb_python import PotatoDB
 
 db = PotatoDB.open("./my_data")
+# Ephemeral session: PotatoDB.open(":memory:")
 
 db.execute("CREATE TABLE products (id INT, name VARCHAR, price DOUBLE);")
 db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99);")

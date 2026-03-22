@@ -97,7 +97,7 @@ pub struct TableMeta {
     pub name: String,
     /// Ordered list of columns that make up the table schema.
     pub columns: Vec<ColumnDef>,
-    /// Storage location -- a local directory path or `s3://` URL.
+    /// Storage location: local directory, `s3://...`, or `memory://...` table listing URL.
     pub path: String,
     /// Hive-style partition columns (empty when unpartitioned).
     #[serde(default)]

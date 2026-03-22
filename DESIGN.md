@@ -101,16 +101,16 @@ SQL.
                              │
                     ┌────────▼────────────────────────────────────┐
                     │              ObjectStore                    │
-                    │   LocalFileSystem  │  AmazonS3              │
-                    └────────┬───────────┴─────────┬──────────────┘
-                             │                     │
-                    ┌────────▼────────┐   ┌────────▼────────┐
-                    │  Local disk     │   │  S3 / MinIO     │
-                    │  potatodb_data/ │   │  s3://bucket/   │
-                    │   table_a/      │   │   prefix/       │
-                    │     *.parquet   │   │     *.parquet   │
-                    │   catalog.json  │   │   catalog.json  │
-                    └─────────────────┘   └─────────────────┘
+                    │ LocalFileSystem │ AmazonS3 │ InMemory       │
+                    └────────┬────────┴────┬─────┴────────┬───────┘
+                             │             │              │
+                    ┌────────▼────────┐   ┌─▼────────┐  ┌──▼──────────────┐
+                    │  Local disk     │   │ S3/MinIO │  │ RAM (process)   │
+                    │  potatodb_data/ │   │s3://…/   │  │ memory://…/     │
+                    │   table_a/      │   │ *.parquet│  │ *.parquet       │
+                    │     *.parquet   │   │catalog   │  │ catalog.json    │
+                    │   catalog.json  │   │ .json    │  │ (ephemeral)     │
+                    └─────────────────┘   └──────────┘  └─────────────────┘
 ```
 
 ---
@@ -172,9 +172,10 @@ potatodb (binary)                 potatodb-server
 
 ### One table = one directory of Parquet files
 
-Every table maps to a filesystem directory (local) or an object key
-prefix (S3). Each `INSERT` produces one Parquet file named with a UUID.
-`SELECT` queries read across all files in the directory.
+Every table maps to a filesystem directory (local), an object key
+prefix (S3), or the same prefix layout on an in-memory `ObjectStore`.
+Each `INSERT` produces one Parquet file named with a UUID.
+`SELECT` queries read across all files in the directory (or listing prefix).
 
 ```
 potatodb_data/
@@ -284,8 +285,9 @@ CatalogData
 
 The catalog is serialized as pretty-printed JSON via serde and written
 through the `ObjectStore` trait. This means the same code path works
-for both local files (`potatodb_data/catalog.json`) and S3
-(`s3://bucket/prefix/catalog.json`).
+for local files (`potatodb_data/catalog.json`), S3
+(`s3://bucket/prefix/catalog.json`), and in-memory storage (`catalog.json`
+or `{prefix}/catalog.json` keys in `InMemory`).
 
 On every mutation (`add_table`, `remove_table`, `add_index`, etc.), the
 full catalog is re-serialized and written atomically. During an explicit
@@ -882,11 +884,12 @@ Every `append()` call does `writer.flush()` + `writer.sync_data()`.
 This ensures the entry is on stable storage before the call returns.
 The WAL is the durability backstop for local databases.
 
-### S3 mode
+### S3 and in-memory modes
 
-The WAL is disabled when the data URL starts with `s3://`. S3 writes
-are durable once acknowledged by the service, so there is no local
-journal to keep.
+The WAL is disabled when the data URL is not a local filesystem path:
+`PotatoDB::new` skips `wal.log` and Arrow IPC WAL for `s3://` and for
+in-memory URLs (`:memory:`, `memory://...`). S3 writes are durable once
+acknowledged by the service; in-memory state is ephemeral and lost on exit.
 
 ---
 
@@ -1052,6 +1055,26 @@ deletes them one by one via `ObjectStore::delete`.
   files.
 - **Retention policy** -- file age queries use local filesystem
   metadata, which is unavailable on S3.
+
+---
+
+## In-memory backend
+
+When `data_url` is `:memory:`, `memory` (case-insensitive), or starts with
+`memory://`:
+
+1. The engine builds an [`InMemory`](https://docs.rs/object_store/latest/object_store/memory/struct.InMemory.html)
+   `ObjectStore` and registers it with DataFusion under `memory://<host>/`.
+2. Catalog and Parquet objects use the same key-prefix layout as S3 (optional
+   path prefix after the host). Table listing URLs end with `/` so DataFusion
+   treats each table as a directory listing.
+3. No WAL, no Arrow IPC WAL, no on-disk CDC log. `is_memory` is set on
+   `PotatoDB`; `PotatoDB::is_in_memory()` exposes this to embeddings.
+4. **Backup/restore** (tar) is unsupported, same as S3. **Retention policy**
+   applies only to local disk (object-store backends return early).
+
+This mode is intended for tests, scratch sessions, and tooling — not for
+durable production data.
 
 ---
 

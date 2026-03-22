@@ -556,8 +556,10 @@ namespace potato {
     {
     public:
 
-        /// Opens a local database at the given path.
+        /// Opens a database at the given path or URL.
         ///
+        /// Accepts a local directory, `:memory:` / `memory://...` (ephemeral in-memory),
+        /// or any string accepted by `potato_open_local` (see C header).
         /// Returns an error if the database cannot be opened.
         static Expected<Database> open(const std::string& data_dir)
         {
@@ -566,8 +568,9 @@ namespace potato {
             return Expected<Database>(Database(h));
         }
 
-        /// Opens a database with optional S3 configuration.
+        /// Opens an S3-backed database (`data_dir` must start with `s3://`).
         ///
+        /// For in-memory mode use `open(":memory:")` or `open("memory://...")` instead.
         /// Returns an error if the database cannot be opened.
         static Expected<Database> open_s3(const std::string& data_dir,
             const std::string& s3_endpoint,

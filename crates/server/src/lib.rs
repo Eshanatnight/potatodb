@@ -402,8 +402,9 @@ fn array_value_to_string(array: &dyn Array, row: usize) -> String {
 
 /// Starts the `PotatoDB` pgwire server on the given address.
 ///
-/// `data_url` is passed to [`PotatoDB::new`]. `bind_addr` is a socket
-/// address like `"127.0.0.1:5432"`.
+/// `data_url` is passed to [`PotatoDB::new`] — local path, `s3://...`,
+/// `:memory:`, `memory://...`, etc. `bind_addr` is a socket address like
+/// `"127.0.0.1:5432"`.
 ///
 /// # Errors
 ///

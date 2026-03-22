@@ -14,7 +14,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[derive(Parser)]
 #[command(name = "potatodb", about = "A Parquet-backed SQL database")]
 struct Cli {
-    /// Data location: local path (./data) or S3 URL (<s3://bucket/prefix>)
+    /// Data location: local path, S3 URL (<s3://bucket/prefix>), or in-memory (`:memory:` / `memory://...`)
     #[arg(long, default_value = "./potatodb_data")]
     data_dir: String,
 
