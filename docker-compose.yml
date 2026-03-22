@@ -1,0 +1,170 @@
+# SeaweedFS stack for local S3-compatible storage.
+#
+#   docker compose up -d
+#
+# Create the default S3 bucket once (idempotent; matches PotatoDB examples):
+#
+#   docker compose --profile init run --rm init-bucket
+#
+# Run engine integration smoke tests (cluster must be healthy first):
+#
+#   docker compose --profile smoke run --rm smoke
+#
+# From the host against Seaweed S3 (create bucket first if needed):
+#
+#   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+#   AWS_ENDPOINT_URL=http://127.0.0.1:8333 \
+#   cargo run -- --data-dir s3://potatodb-data \
+#     --s3-endpoint http://127.0.0.1:8333 \
+#     --s3-region us-east-1 \
+#     --s3-allow-http \
+#     -f ./sample_data.sql
+#
+# Same thing via the local image (endpoint is the s3 container; create bucket first):
+#
+#   docker compose --profile init run --rm init-bucket
+#   docker compose --profile sample run --rm potatodb
+
+services:
+  master:
+    image: chrislusf/seaweedfs
+    ports:
+      - 9333:9333
+    command: 'master -ip=master -ip.bind=0.0.0.0'
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://127.0.0.1:9333/cluster/status >/dev/null']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  volume:
+    image: chrislusf/seaweedfs
+    ports:
+      - 8080:8080
+    command: 'volume -ip=volume -master="master:9333" -ip.bind=0.0.0.0 -port=8080'
+    depends_on:
+      master:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://127.0.0.1:8080/status >/dev/null']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  filer:
+    image: chrislusf/seaweedfs
+    ports:
+      - 8888:8888
+      - 18888:18888
+    command: 'filer -ip=filer -master="master:9333" -ip.bind=0.0.0.0'
+    depends_on:
+      master:
+        condition: service_healthy
+      volume:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://127.0.0.1:8888/healthz >/dev/null']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  s3:
+    image: chrislusf/seaweedfs
+    ports:
+      - 8333:8333
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+    command: 's3 -filer="filer:8888" -ip.bind=0.0.0.0'
+    depends_on:
+      master:
+        condition: service_healthy
+      volume:
+        condition: service_healthy
+      filer:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS http://127.0.0.1:8333/healthz >/dev/null']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  init-bucket:
+    profiles:
+      - init
+    image: amazon/aws-cli:latest
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        set -eu
+        EP=http://s3:8333
+        if aws s3api head-bucket --bucket potatodb-data --endpoint-url "$$EP" 2>/dev/null; then
+          echo "Bucket potatodb-data already exists."
+        else
+          aws s3api create-bucket --bucket potatodb-data --endpoint-url "$$EP"
+          echo "Created bucket potatodb-data."
+        fi
+        aws s3 ls --endpoint-url "$$EP"
+
+  potatodb:
+    profiles:
+      - sample
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: potatodb:local
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://s3:8333
+    volumes:
+      - ./sample_data.sql:/sample_data.sql:ro
+    command:
+      - --data-dir
+      - s3://potatodb-data
+      - --s3-endpoint
+      - http://s3:8333
+      - --s3-region
+      - us-east-1
+      - --s3-allow-http
+      - -f
+      - /sample_data.sql
+    restart: 'no'
+
+  smoke:
+    profiles:
+      - smoke
+    image: rust:1.94-bookworm
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://s3:8333
+    depends_on:
+      s3:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        curl -fsS "http://s3:8333/healthz" >/dev/null
+        cargo test -p potatodb-engine --test smoke

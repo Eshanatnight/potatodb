@@ -1555,7 +1555,9 @@ impl PotatoDB {
     }
 
     fn table_url(&self, table_name: &str) -> String {
-        format!("{}/{table_name}", self.data_url.trim_end_matches('/'))
+        // Trailing `/` is required: DataFusion's `ListingTableUrl::is_collection()` is true
+        // only when the URL path ends with `/`, otherwise INSERT is rejected as "single file".
+        format!("{}/{table_name}/", self.data_url.trim_end_matches('/'))
     }
 
     fn table_obj_prefix(&self, table_name: &str) -> ObjPath {
@@ -1688,7 +1690,12 @@ impl PotatoDB {
         table_url_str: &str,
         partition_columns: &[String],
     ) -> Result<(), BoxError> {
-        let table_url = ListingTableUrl::parse(table_url_str)?;
+        let table_url_str = if table_url_str.ends_with('/') {
+            table_url_str.to_string()
+        } else {
+            format!("{table_url_str}/")
+        };
+        let table_url = ListingTableUrl::parse(&table_url_str)?;
         let parallelism = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(4);
