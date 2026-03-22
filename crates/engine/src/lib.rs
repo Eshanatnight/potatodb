@@ -398,6 +398,14 @@ struct Savepoint {
     rewrite_backups: HashMap<String, Vec<RecordBatch>>,
 }
 
+/// Where catalog and Parquet data live (local filesystem, S3, or RAM).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataLocationKind {
+    Local,
+    S3,
+    Memory,
+}
+
 /// Buffered INSERT payload for a single table/column-shape.
 struct BufferedInsert {
     columns: Option<Vec<String>>,
@@ -419,9 +427,8 @@ pub struct PotatoDB {
     /// Canonical data location (local absolute path, `s3://bucket/prefix`, or `memory://...`).
     data_url: String,
     store: Arc<dyn ObjectStore>,
-    is_s3: bool,
-    /// Ephemeral storage: Parquet and catalog live in RAM only (no WAL / disk).
-    is_memory: bool,
+    /// Local disk, S3, or ephemeral in-memory (`:memory:` / `memory://...`).
+    data_location: DataLocationKind,
     /// Object key prefix within the S3 bucket (empty for local storage).
     s3_prefix: String,
     /// Active explicit transaction, if any.
@@ -438,8 +445,6 @@ pub struct PotatoDB {
     replaying_wal: bool,
     /// Recent query log entries.
     query_log: VecDeque<QueryLogEntry>,
-    /// Slow query threshold in milliseconds.
-    slow_query_threshold_ms: u64,
     /// Max number of query log entries kept in memory.
     max_query_log_entries: usize,
     /// WAL size threshold for periodic autocommit checkpoints.
@@ -661,7 +666,7 @@ fn memory_data_url(host: &str, prefix: &str) -> String {
 impl PotatoDB {
     #[inline]
     const fn is_local_disk(&self) -> bool {
-        !self.is_s3 && !self.is_memory
+        matches!(self.data_location, DataLocationKind::Local)
     }
 
     /// Creates a new `PotatoDB` instance.
@@ -689,7 +694,7 @@ impl PotatoDB {
         let gs = datafusion::functions_table::generate_series();
         ctx.register_udtf("generate_series", Arc::clone(gs.function()));
 
-        let (store, is_s3, is_memory, s3_prefix, data_url_normalized) =
+        let (store, data_location, s3_prefix, data_url_normalized) =
             if data_url.starts_with("s3://") {
                 let parsed = Url::parse(&data_url)?;
                 let bucket = parsed
@@ -722,13 +727,13 @@ impl PotatoDB {
 
                 let normalized =
                     format!("s3://{bucket}") + if prefix.is_empty() { "" } else { "/" } + &prefix;
-                (s3, true, false, prefix, normalized)
+                (s3, DataLocationKind::S3, prefix, normalized)
             } else if let Some((host, prefix)) = try_parse_memory_url(&data_url)? {
                 let memory_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
                 let bucket_url = Url::parse(&format!("memory://{host}/"))?;
                 ctx.register_object_store(&bucket_url, memory_store.clone());
                 let normalized = memory_data_url(&host, &prefix);
-                (memory_store, false, true, prefix, normalized)
+                (memory_store, DataLocationKind::Memory, prefix, normalized)
             } else {
                 let abs_path = PathBuf::from(&data_url);
                 std::fs::create_dir_all(&abs_path)?;
@@ -749,24 +754,20 @@ impl PotatoDB {
                 let local: Arc<dyn ObjectStore> =
                     Arc::new(LocalFileSystem::new_with_prefix(&abs_path)?);
                 let normalized = abs_path.to_string_lossy().to_string();
-                (local, false, false, String::new(), normalized)
+                (local, DataLocationKind::Local, String::new(), normalized)
             };
 
-        let catalog_obj_path = if is_s3 || is_memory {
-            if s3_prefix.is_empty() {
-                ObjPath::from("catalog.json")
-            } else {
-                ObjPath::from(format!("{s3_prefix}/catalog.json"))
-            }
-        } else {
+        let catalog_obj_path = if data_location == DataLocationKind::Local || s3_prefix.is_empty() {
             ObjPath::from("catalog.json")
+        } else {
+            ObjPath::from(format!("{s3_prefix}/catalog.json"))
         };
 
         let mut catalog = Catalog::load(store.clone(), catalog_obj_path).await?;
 
-        let wal_base_dir = if is_memory {
+        let wal_base_dir = if data_location == DataLocationKind::Memory {
             None
-        } else if is_s3 {
+        } else if data_location == DataLocationKind::S3 {
             Some({
                 let dir = s3_config
                     .as_ref()
@@ -833,10 +834,6 @@ impl PotatoDB {
             (None, None, Vec::new())
         };
 
-        let slow_query_threshold_ms = std::env::var("POTATODB_SLOW_QUERY_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(500);
         let max_query_log_entries = std::env::var("POTATODB_QUERY_LOG_MAX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -902,18 +899,17 @@ impl PotatoDB {
                 .insert(current_user.clone(), vec!["admin".to_string()]);
         }
 
-        let cdc_log_path = if is_s3 || is_memory {
-            None
-        } else {
+        let cdc_log_path = if data_location == DataLocationKind::Local {
             Some(PathBuf::from(&data_url_normalized).join("_cdc_log.jsonl"))
+        } else {
+            None
         };
         let mut db = Self {
             ctx,
             catalog,
             data_url: data_url_normalized,
             store,
-            is_s3,
-            is_memory,
+            data_location,
             s3_prefix,
             active_txn: None,
             prepared_statements: HashMap::new(),
@@ -922,7 +918,6 @@ impl PotatoDB {
             txn_counter: 1,
             replaying_wal: false,
             query_log: VecDeque::new(),
-            slow_query_threshold_ms,
             max_query_log_entries,
             wal_checkpoint_threshold_bytes,
             wal_checkpoint_every_commits,
@@ -1019,7 +1014,7 @@ impl PotatoDB {
     /// Returns `true` when using the ephemeral in-memory object store (`:memory:` / `memory://...`).
     #[must_use]
     pub const fn is_in_memory(&self) -> bool {
-        self.is_memory
+        matches!(self.data_location, DataLocationKind::Memory)
     }
 
     /// Returns all known table names from the catalog.
@@ -1203,7 +1198,7 @@ impl PotatoDB {
             let mut row_count = None;
             let mut min_values = HashMap::new();
             let mut max_values = HashMap::new();
-            if !self.is_s3
+            if self.data_location != DataLocationKind::S3
                 && let Some(meta) = table_meta.as_ref()
                 && let Some(filename) = entry.location.as_ref().rsplit('/').next()
             {
@@ -1877,16 +1872,16 @@ impl PotatoDB {
 
     /// Deletes a table's storage directory (local) or all objects (S3).
     async fn delete_table_storage(&self, meta: &TableMeta) -> Result<(), BoxError> {
-        if !self.is_local_disk() {
+        if self.is_local_disk() {
+            let table_dir = PathBuf::from(&meta.path);
+            if table_dir.exists() {
+                std::fs::remove_dir_all(&table_dir)?;
+            }
+        } else {
             let prefix = self.table_obj_prefix(&meta.name);
             let entries: Vec<_> = self.store.list(Some(&prefix)).try_collect().await?;
             for entry in entries {
                 self.store.delete(&entry.location).await?;
-            }
-        } else {
-            let table_dir = PathBuf::from(&meta.path);
-            if table_dir.exists() {
-                std::fs::remove_dir_all(&table_dir)?;
             }
         }
         Ok(())
@@ -3024,9 +3019,7 @@ impl PotatoDB {
         while self.query_log.len() > self.max_query_log_entries {
             let _ = self.query_log.pop_front();
         }
-        if duration.as_millis() >= u128::from(self.slow_query_threshold_ms) {
-            eprintln!("slow query ({} ms): {}", duration.as_millis(), sql.trim());
-        }
+
         result
     }
 

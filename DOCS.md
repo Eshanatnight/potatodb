@@ -656,6 +656,7 @@ potatodb/
     display/                   potatodb-display
     engine/                    potatodb-engine
       tests/smoke.rs           integration tests
+      tests/in_memory.rs       in-memory storage (`:memory:` / `memory://...`)
     wal/                       potatodb-wal
     server/                    potatodb-server (pgwire)
     ffi/                       potatodb-ffi
@@ -743,7 +744,9 @@ cargo fmt --all -- --check
 
 ## Testing
 
-Integration tests live in `crates/engine/tests/smoke.rs` and now cover:
+Integration tests live in `crates/engine/tests/smoke.rs` and `in_memory.rs`.
+
+**smoke.rs** covers:
 
 - core lifecycle (`CREATE TABLE`, `INSERT`, `SELECT`, `DROP`)
 - transaction commit/rollback including destructive rewrite paths
@@ -753,12 +756,19 @@ Integration tests live in `crates/engine/tests/smoke.rs` and now cover:
 - CDC virtual table, `LISTEN`/`NOTIFY`, plan cache behavior
 - copy/import schema evolution paths
 
+**in_memory.rs** covers in-memory storage (`:memory:` / `memory://...`): URL
+normalization, CRUD, joins, `BEGIN`/`COMMIT`/`ROLLBACK`, `FLUSH`/`VACUUM`,
+`execute_readonly`, backup/restore rejection, and `DROP TABLE`.
+
 ```bash
 # Run all tests
 cargo test --workspace
 
 # Run only engine integration tests
 cargo test -p potatodb-engine
+
+# In-memory integration tests only
+cargo test -p potatodb-engine --test in_memory
 
 # Run a single test by name
 cargo test -p potatodb-engine test_create_index_sorts_data

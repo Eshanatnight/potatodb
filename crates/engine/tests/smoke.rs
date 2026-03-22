@@ -3729,21 +3729,3 @@ async fn test_migration_persists_across_restarts() {
         assert_eq!(row_count(&batches), 0);
     }
 }
-
-#[tokio::test]
-async fn test_in_memory_create_insert_select() {
-    let mut db = PotatoDB::new(":memory:".to_string(), None).await.unwrap();
-    assert!(db.is_in_memory());
-
-    db.execute("CREATE TABLE mem_t (id INT, v VARCHAR);")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO mem_t VALUES (1, 'x');").await.unwrap();
-
-    let batches = expect_records(
-        db.execute("SELECT * FROM mem_t ORDER BY id;")
-            .await
-            .unwrap(),
-    );
-    assert_eq!(row_count(&batches), 1);
-}
