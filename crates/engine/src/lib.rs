@@ -1625,9 +1625,8 @@ impl PotatoDB {
         let prefix = self.table_obj_prefix(table_name);
         let obj_path = ObjPath::from(format!("{prefix}/{filename}"));
 
-        let props = build_writer_props(&schema);
-
         if self.is_local_disk() {
+            let props = build_writer_props(&schema);
             let table_meta = self.catalog.tables.get(table_name);
             let dir = table_meta
                 .map(|m| PathBuf::from(&m.path))
@@ -1636,19 +1635,26 @@ impl PotatoDB {
                 });
             std::fs::create_dir_all(&dir)?;
             let file_path = dir.join(&filename);
-            let file = File::create(&file_path)?;
-            let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-            for batch in batches {
-                if batch.num_rows() > 0 {
-                    writer.write(batch)?;
+            let owned_batches: Vec<RecordBatch> = batches.to_vec();
+            tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+                let file = File::create(&file_path)?;
+                let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+                for batch in &owned_batches {
+                    if batch.num_rows() > 0 {
+                        writer.write(batch)?;
+                    }
                 }
-            }
-            writer.close()?;
-            debug_assert!(
-                file_path.exists(),
-                "write_batches_to_parquet: file missing after write: {file_path:?}"
-            );
+                writer.close()?;
+                debug_assert!(
+                    file_path.exists(),
+                    "write_batches_to_parquet: file missing after write: {file_path:?}"
+                );
+                Ok(())
+            })
+            .await
+            .map_err(|e| -> BoxError { format!("spawn_blocking join error: {e}").into() })??;
         } else {
+            let props = build_writer_props(&schema);
             let estimated_bytes = estimate_batch_bytes(batches);
             let mut buf: Vec<u8> = Vec::with_capacity(estimated_bytes / 2 + 4096);
             {
@@ -1693,50 +1699,14 @@ impl PotatoDB {
             self.flush_table(table_name).await?;
         }
 
-        let (prev_batches_len, prev_row_count, prev_bytes) = {
-            let entry = self
-                .write_buffer
-                .entry(table_name.to_string())
-                .or_insert_with(|| BufferedInsert {
-                    columns: columns.clone(),
-                    batches: Vec::new(),
-                    row_count: 0,
-                    approx_bytes: 0,
-                    first_buffered_at: Instant::now(),
-                });
-
-            if entry.batches.is_empty() {
-                entry.columns = columns;
-                entry.first_buffered_at = Instant::now();
-            }
-
-            let prev_batches_len = entry.batches.len();
-            let prev_row_count = entry.row_count;
-            let prev_bytes = entry.approx_bytes;
-
-            entry.batches.extend(batches.clone());
-            entry.row_count = entry.row_count.saturating_add(incoming_rows);
-            entry.approx_bytes = entry.approx_bytes.saturating_add(incoming_bytes);
-
-            (prev_batches_len, prev_row_count, prev_bytes)
-        };
-
-        let target_columns = {
-            let entry = self
-                .write_buffer
+        let target_columns = if let Some(ref cols) = columns {
+            cols.clone()
+        } else {
+            self.catalog
+                .tables
                 .get(table_name)
-                .ok_or_else(|| -> BoxError {
-                    "buffer_insert_batches: missing buffer entry".into()
-                })?;
-            if let Some(ref cols) = entry.columns {
-                cols.clone()
-            } else {
-                self.catalog
-                    .tables
-                    .get(table_name)
-                    .map(|m| m.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            }
+                .map(|m| m.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
         };
 
         match self
@@ -1754,15 +1724,6 @@ impl PotatoDB {
                 }
             }
             Err(e) => {
-                let entry = self
-                    .write_buffer
-                    .get_mut(table_name)
-                    .ok_or_else(|| -> BoxError {
-                        "buffer_insert_batches: missing buffer entry".into()
-                    })?;
-                entry.batches.truncate(prev_batches_len);
-                entry.row_count = prev_row_count;
-                entry.approx_bytes = prev_bytes;
                 return Err(e);
             }
         }
@@ -1771,6 +1732,28 @@ impl PotatoDB {
             && let Some(ref mut awal) = self.arrow_wal
         {
             awal.append(table_name, &batches)?;
+        }
+
+        {
+            let entry = self
+                .write_buffer
+                .entry(table_name.to_string())
+                .or_insert_with(|| BufferedInsert {
+                    columns: columns.clone(),
+                    batches: Vec::new(),
+                    row_count: 0,
+                    approx_bytes: 0,
+                    first_buffered_at: Instant::now(),
+                });
+
+            if entry.batches.is_empty() {
+                entry.columns = columns;
+                entry.first_buffered_at = Instant::now();
+            }
+
+            entry.batches.extend(batches);
+            entry.row_count = entry.row_count.saturating_add(incoming_rows);
+            entry.approx_bytes = entry.approx_bytes.saturating_add(incoming_bytes);
         }
 
         let should_flush = if let Some(entry) = self.write_buffer.get(table_name) {
@@ -1939,7 +1922,7 @@ impl PotatoDB {
     }
 
     async fn drain_pending_analyze(&mut self) {
-        if self.pending_analyze_tables.is_empty() {
+        if self.pending_analyze_tables.is_empty() || !self.write_buffer.is_empty() {
             return;
         }
         let tables = std::mem::take(&mut self.pending_analyze_tables);
