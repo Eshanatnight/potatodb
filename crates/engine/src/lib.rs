@@ -1721,14 +1721,14 @@ impl PotatoDB {
             (prev_batches_len, prev_row_count, prev_bytes)
         };
 
-        let (target_columns, batches_for_validate) = {
+        let target_columns = {
             let entry = self
                 .write_buffer
                 .get(table_name)
                 .ok_or_else(|| -> BoxError {
                     "buffer_insert_batches: missing buffer entry".into()
                 })?;
-            let target_columns: Vec<String> = if let Some(ref cols) = entry.columns {
+            if let Some(ref cols) = entry.columns {
                 cols.clone()
             } else {
                 self.catalog
@@ -1736,29 +1736,35 @@ impl PotatoDB {
                     .get(table_name)
                     .map(|m| m.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
                     .unwrap_or_default()
-            };
-            (target_columns, entry.batches.clone())
+            }
         };
 
-        if let Err(e) = self
+        match self
             .validate_constraints_batch(
                 table_name,
                 &target_columns,
-                &batches_for_validate,
+                &batches,
                 ConstraintValidationPhase::BeforeInsert,
             )
             .await
         {
-            let entry = self
-                .write_buffer
-                .get_mut(table_name)
-                .ok_or_else(|| -> BoxError {
-                    "buffer_insert_batches: missing buffer entry".into()
-                })?;
-            entry.batches.truncate(prev_batches_len);
-            entry.row_count = prev_row_count;
-            entry.approx_bytes = prev_bytes;
-            return Err(e);
+            Ok(merges) => {
+                for (cache_key, keys) in merges {
+                    self.merge_uniqueness_keys(&cache_key, &keys);
+                }
+            }
+            Err(e) => {
+                let entry = self
+                    .write_buffer
+                    .get_mut(table_name)
+                    .ok_or_else(|| -> BoxError {
+                        "buffer_insert_batches: missing buffer entry".into()
+                    })?;
+                entry.batches.truncate(prev_batches_len);
+                entry.row_count = prev_row_count;
+                entry.approx_bytes = prev_bytes;
+                return Err(e);
+            }
         }
 
         if !self.replaying_wal
@@ -1805,15 +1811,6 @@ impl PotatoDB {
                 .unwrap_or_default()
         };
 
-        let merges = self
-            .validate_constraints_batch(
-                table_name,
-                &target_columns,
-                &buffered.batches,
-                ConstraintValidationPhase::BeforeInsert,
-            )
-            .await?;
-
         let row_count = buffered.row_count;
 
         let table_schema = self
@@ -1840,12 +1837,6 @@ impl PotatoDB {
             ConstraintValidationPhase::AfterInsert,
         )
         .await?;
-
-        if row_count > 0 {
-            for (cache_key, keys) in merges {
-                self.merge_uniqueness_keys(&cache_key, &keys);
-            }
-        }
 
         if let Some(ref mut awal) = self.arrow_wal {
             awal.checkpoint_table(table_name)?;
