@@ -53,7 +53,13 @@ impl PyPotatoDB {
         s3_allow_http: bool,
         wal_dir: Option<String>,
     ) -> PyResult<Self> {
-        let rt = Arc::new(Runtime::new().map_err(pyerr)?);
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .map_err(pyerr)?,
+        );
         let s3_config = path.starts_with("s3://").then_some(S3Config {
             endpoint: s3_endpoint,
             region: s3_region,

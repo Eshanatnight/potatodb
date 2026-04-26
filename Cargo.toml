@@ -58,7 +58,7 @@ potatodb-http = { path = "crates/http" }
 
 [profile.release]
 opt-level = 3
-#lto = "fat"
+lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
@@ -69,6 +69,7 @@ opt-level = 3
 # Custom profile for profiling runs. Use with `cargo build --profile profiling`.
 [profile.profiling]
 opt-level = 3
+lto = "fat"
 codegen-units = 1
 # Keep debug info for symbol resolution in profilers
 debug = 2
@@ -79,3 +80,6 @@ inherits = "release"
 
 [profile.profiling.build-override]
 opt-level = 3
+
+[patch.crates-io]
+datafusion-physical-plan = { path = "patches/datafusion-physical-plan" }

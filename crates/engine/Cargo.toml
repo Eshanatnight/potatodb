@@ -13,6 +13,7 @@ arrow.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
 futures.workspace = true
+libc = "0.2"
 object_store.workspace = true
 parquet.workspace = true
 sqlparser.workspace = true

@@ -1,7 +1,7 @@
-# Optional: for local dev with AVX2/AVX-512 SIMD, set RUSTFLAGS="-C target-cpu=native"
-# Not set here because target-cpu=native causes SIGILL on CI (GitHub Actions runners).
-# [build]
-# rustflags = ["-C", "target-cpu=native"]
+# target-cpu=native enables AVX-512 SIMD on AMD EPYC for vectorized Arrow
+# kernels, hash operations, and memory copies. Disable for CI/portable builds.
+[build]
+rustflags = ["-C", "target-cpu=native"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "26.0"

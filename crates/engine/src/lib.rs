@@ -67,6 +67,8 @@ use datafusion::optimizer::OptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::*;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
@@ -511,9 +513,13 @@ pub struct PotatoDB {
 }
 
 /// Returns the Parquet compression setting from `POTATODB_PARQUET_COMPRESSION`,
-/// defaulting to `"zstd(3)"`.
+/// defaulting to `"lz4"`.
+///
+/// LZ4 decompresses 3–5x faster than ZSTD with modest compression-ratio cost,
+/// eliminating the ~30 % CPU overhead that ZSTD decompression + compression
+/// imposed on typical query workloads (AMD uProf profiling, Apr 2026).
 fn parquet_compression_str() -> String {
-    std::env::var("POTATODB_PARQUET_COMPRESSION").unwrap_or_else(|_| "zstd(3)".into())
+    std::env::var("POTATODB_PARQUET_COMPRESSION").unwrap_or_else(|_| "lz4".into())
 }
 
 /// Parses a compression string like `"zstd(3)"`, `"snappy"`, or `"gzip(6)"`
@@ -556,28 +562,65 @@ fn parse_parquet_compression(s: &str) -> parquet::basic::Compression {
     }
 }
 
+/// Builds a [`RuntimeEnv`] with a bounded memory pool.
+///
+/// Configurable via:
+/// - `POTATODB_MEMORY_LIMIT_MB` — Max memory for query execution (default: 75% of system RAM)
+///
+/// Uses [`FairSpillPool`] which distributes memory fairly across concurrent
+/// operators and supports spill-to-disk, avoiding OOM on large hash joins.
+fn build_runtime_env() -> Result<RuntimeEnv, BoxError> {
+    let sys_memory = {
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages > 0 && page_size > 0 {
+            (pages as usize) * (page_size as usize)
+        } else {
+            4 * 1024 * 1024 * 1024 // 4 GiB fallback
+        }
+    };
+
+    let pool_size = std::env::var("POTATODB_MEMORY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(sys_memory * 3 / 4);
+
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+        .build()?;
+    Ok(runtime)
+}
+
 /// Builds a [`SessionConfig`] tuned for Parquet performance.
 ///
 /// Key settings can be overridden via environment variables:
-/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 32768)
+/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 8192)
 /// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 16384)
 /// - `POTATODB_TARGET_PARTITIONS` — Number of parallel partitions (default: CPU cores)
 /// - `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` — Enforce batch size in hash joins (default: true)
 /// - `POTATODB_COALESCE_BATCHES` — Coalesce small batches between operators (default: true)
+/// - `POTATODB_PREFER_HASH_JOIN` — Prefer hash joins over sort-merge joins (default: false)
 fn build_session_config() -> SessionConfig {
     let parallelism = std::env::var("POTATODB_TARGET_PARTITIONS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
-            std::thread::available_parallelism()
+            let cpus = std::thread::available_parallelism()
                 .map(std::num::NonZero::get)
-                .unwrap_or(4)
+                .unwrap_or(4);
+            // Cap at a reasonable level: excessive partitions (e.g. 512 on a
+            // large EPYC) create massive repartition channel overhead —
+            // SendFuture::poll + DistributionSender::drop + BatchPartitioner
+            // consumed ~14 % of CPU at 512 partitions due to O(N^2) channel
+            // fan-out and lock contention on the distributor gate.
+            cpus.min(16)
         });
 
     let batch_size = std::env::var("POTATODB_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32768);
+        .unwrap_or(8192);
 
     let write_batch_size = std::env::var("POTATODB_PARQUET_WRITE_BATCH_SIZE")
         .ok()
@@ -602,6 +645,15 @@ fn build_session_config() -> SessionConfig {
         })
         .unwrap_or(true);
 
+    let prefer_hash_join = std::env::var("POTATODB_PREFER_HASH_JOIN")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => v.parse::<bool>().ok(),
+        })
+        .unwrap_or(false);
+
     let mut config = SessionConfig::new()
         .with_information_schema(true)
         .with_batch_size(batch_size)
@@ -610,6 +662,8 @@ fn build_session_config() -> SessionConfig {
         .with_coalesce_batches(coalesce_batches);
 
     config.options_mut().optimizer.skip_failed_rules = true;
+    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+    config.options_mut().optimizer.repartition_joins = true;
 
     let parquet = &mut config.options_mut().execution.parquet;
 
@@ -626,6 +680,8 @@ fn build_session_config() -> SessionConfig {
     parquet.max_row_group_size = 1_048_576;
     parquet.write_batch_size = write_batch_size;
     parquet.data_page_row_count_limit = 20_000;
+
+    config.options_mut().execution.sort_spill_reservation_bytes = 64 * 1024 * 1024;
 
     config
 }
@@ -687,7 +743,8 @@ impl PotatoDB {
     /// connection fails, or the catalog cannot be loaded.
     pub async fn new(data_url: String, s3_config: Option<S3Config>) -> Result<Self, BoxError> {
         let config = build_session_config();
-        let ctx = SessionContext::new_with_config(config);
+        let runtime = build_runtime_env()?;
+        let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime));
         ctx.add_optimizer_rule(Arc::new(SplitScalarSubqueries));
 
         // Ensure generate_series table function is available (PostgreSQL-compatible)
@@ -1317,6 +1374,11 @@ impl PotatoDB {
 
         let props = WriterProperties::builder()
             .set_compression(parse_parquet_compression(&parquet_compression_str()))
+            .set_dictionary_enabled(true)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+            .set_write_batch_size(16384)
+            .set_max_row_group_size(1_048_576)
+            .set_data_page_row_count_limit(20_000)
             .build();
 
         if self.is_local_disk() {
@@ -1341,7 +1403,8 @@ impl PotatoDB {
                 "write_batches_to_parquet: file missing after write: {file_path:?}"
             );
         } else {
-            let mut buf: Vec<u8> = Vec::new();
+            let estimated_bytes = estimate_batch_bytes(batches);
+            let mut buf: Vec<u8> = Vec::with_capacity(estimated_bytes / 2 + 4096);
             {
                 let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
                 for batch in batches {
@@ -4950,7 +5013,7 @@ impl PotatoDB {
 
                 match (&clause.clause_kind, &clause.action) {
                     (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                        let mut update_map: HashMap<String, String> = HashMap::new();
+                        let mut update_map: HashMap<String, String> = HashMap::with_capacity(assignments.len());
                         for a in assignments {
                             let col = a.target.to_string().trim_matches('"').to_string();
                             let val = rewrite(&a.value.to_string());
@@ -5661,11 +5724,12 @@ impl PotatoDB {
             conflict_key: String,
         }
 
-        let mut source_rows = Vec::<UpsertRow>::new();
+        let total_rows: usize = source_batches.iter().map(|b| b.num_rows()).sum();
+        let mut source_rows = Vec::<UpsertRow>::with_capacity(total_rows);
         for batch in &source_batches {
             for row in 0..batch.num_rows() {
-                let mut value_map = HashMap::new();
-                let mut row_values_sql = Vec::new();
+                let mut value_map = HashMap::with_capacity(target_columns.len());
+                let mut row_values_sql = Vec::with_capacity(target_columns.len());
                 for (idx, col_name) in target_columns.iter().enumerate() {
                     let literal = array_value_to_sql_literal(batch.column(idx).as_ref(), row);
                     value_map.insert(col_name.clone(), literal.clone());
@@ -5696,8 +5760,8 @@ impl PotatoDB {
             ));
         }
 
-        let mut conflict_predicates = Vec::new();
-        let mut seen_conflict_keys = HashSet::new();
+        let mut conflict_predicates = Vec::with_capacity(source_rows.len());
+        let mut seen_conflict_keys = HashSet::with_capacity(source_rows.len());
         for row in &source_rows {
             if !seen_conflict_keys.insert(row.conflict_key.clone()) {
                 continue;
@@ -5711,7 +5775,7 @@ impl PotatoDB {
             conflict_predicates.push(format!("({pred})"));
         }
 
-        let mut existing_conflict_keys = HashSet::new();
+        let mut existing_conflict_keys = HashSet::with_capacity(source_rows.len());
         if !conflict_predicates.is_empty() {
             let conflict_sql = format!(
                 "SELECT * FROM \"{table_name}\" WHERE {}",
@@ -6234,6 +6298,11 @@ impl PotatoDB {
             );
             let props = WriterProperties::builder()
                 .set_compression(parse_parquet_compression(&parquet_compression_str()))
+                .set_dictionary_enabled(true)
+                .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+                .set_write_batch_size(16384)
+                .set_max_row_group_size(1_048_576)
+                .set_data_page_row_count_limit(20_000)
                 .build();
             let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
             for batch in &batches {

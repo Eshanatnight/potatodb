@@ -1798,8 +1798,6 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "52.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cbe61b12daf81a9f20ba03bd3541165d51f86e004ef37426b11881330eed261"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3710,6 +3708,7 @@ dependencies = [
  "datafusion",
  "futures",
  "hyper 0.14.32",
+ "libc",
  "object_store",
  "parquet",
  "potatodb-catalog",

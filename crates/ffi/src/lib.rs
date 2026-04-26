@@ -246,7 +246,11 @@ pub unsafe extern "C" fn potato_open(
         None
     };
 
-    let rt = match Runtime::new() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
