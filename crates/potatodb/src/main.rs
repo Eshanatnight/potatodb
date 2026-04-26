@@ -62,8 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // buffers, Parquet I/O buffers, hash tables) automatically use 2 MiB
     // pages, reducing L2 DTLB misses measured by uProf across ZSTD, memcpy,
     // and memset hot paths.
-    let _ = std::fs::write("/sys/kernel/mm/transparent_hugepage/enabled", "always");
-    let _ = std::fs::write("/sys/kernel/mm/transparent_hugepage/defrag", "defer+madvise");
+    // let _ = std::fs::write("/sys/kernel/mm/transparent_hugepage/enabled", "always");
+    // let _ = std::fs::write("/sys/kernel/mm/transparent_hugepage/defrag", "defer+madvise");
 
     // --- mimalloc tuning ---
     // Amortize cross-thread free-list collection. The default (10 ms) causes
