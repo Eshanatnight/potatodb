@@ -107,6 +107,21 @@ impl Wal {
         Ok(())
     }
 
+    /// Writes multiple entries, then flushes and syncs once (group
+    /// commit).  Amortizes the `fdatasync` cost across all entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to or syncing the WAL file fails.
+    pub fn append_batch(&mut self, entries: &[WalEntry]) -> io::Result<()> {
+        for entry in entries {
+            self.write_entry(entry)?;
+        }
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        Ok(())
+    }
+
     fn write_entry(&mut self, entry: &WalEntry) -> io::Result<()> {
         let sql_bytes = entry.sql.as_bytes();
         let payload_len = 8 + 1 + sql_bytes.len(); // txn + status + sql

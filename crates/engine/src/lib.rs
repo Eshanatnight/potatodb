@@ -105,6 +105,193 @@ use sql_helpers::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A local `ObjectStore` that serves Parquet reads via `mmap(2)`.
+///
+/// Memory-mapping eliminates per-read `read(2)` syscalls and lets the kernel
+/// page-in data with large sequential readahead, which is a significant win
+/// for scan-heavy workloads where `libc_read` dominated the profile.
+/// Writes and metadata operations delegate to the inner `LocalFileSystem`.
+#[derive(Debug)]
+struct MmapLocalStore {
+    inner: LocalFileSystem,
+    root: PathBuf,
+}
+
+impl MmapLocalStore {
+    fn new(root: &std::path::Path) -> object_store::Result<Self> {
+        Ok(Self {
+            inner: LocalFileSystem::new_with_prefix(root)?,
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn resolve_path(&self, location: &ObjPath) -> PathBuf {
+        self.root.join(location.as_ref())
+    }
+}
+
+impl std::fmt::Display for MmapLocalStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MmapLocalStore({})", self.root.display())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for MmapLocalStore {
+    async fn put(
+        &self,
+        location: &ObjPath,
+        payload: object_store::PutPayload,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put(location, payload).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &ObjPath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart(
+        &self,
+        location: &ObjPath,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart(location).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjPath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get(&self, location: &ObjPath) -> object_store::Result<object_store::GetResult> {
+        let path = self.resolve_path(location);
+        let file = std::fs::File::open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                object_store::Error::NotFound {
+                    path: path.display().to_string(),
+                    source: e.into(),
+                }
+            } else {
+                object_store::Error::Generic {
+                    store: "MmapLocalStore",
+                    source: e.into(),
+                }
+            }
+        })?;
+        let meta = file.metadata().map_err(|e| object_store::Error::Generic {
+            store: "MmapLocalStore",
+            source: e.into(),
+        })?;
+
+        let file_len = meta.len();
+        if file_len == 0 {
+            return self.inner.get(location).await;
+        }
+
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+            object_store::Error::Generic {
+                store: "MmapLocalStore",
+                source: e.into(),
+            }
+        })?;
+
+        #[cfg(unix)]
+        unsafe {
+            libc::madvise(
+                mmap.as_ptr() as *mut libc::c_void,
+                file_len as usize,
+                libc::MADV_SEQUENTIAL,
+            );
+        }
+
+        let data = bytes::Bytes::from(mmap.to_vec());
+        let objmeta = object_store::ObjectMeta {
+            location: location.clone(),
+            last_modified: meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .into(),
+            size: file_len,
+            e_tag: None,
+            version: None,
+        };
+
+        Ok(object_store::GetResult {
+            payload: object_store::GetResultPayload::Stream(Box::pin(
+                futures::stream::once(async move { Ok(data) }),
+            )),
+            meta: objmeta,
+            range: 0..file_len,
+            attributes: object_store::Attributes::new(),
+        })
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjPath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if options.range.is_some() || options.if_match.is_some() || options.if_none_match.is_some()
+        {
+            return self.inner.get_opts(location, options).await;
+        }
+        self.get(location).await
+    }
+
+    async fn get_range(
+        &self,
+        location: &ObjPath,
+        range: std::ops::Range<u64>,
+    ) -> object_store::Result<bytes::Bytes> {
+        self.inner.get_range(location, range).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjPath,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjPath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 /// Which part of constraint validation to run for a batch insert/flush.
 #[derive(Clone, Copy)]
 enum ConstraintValidationPhase {
@@ -562,6 +749,37 @@ fn parse_parquet_compression(s: &str) -> parquet::basic::Compression {
     }
 }
 
+/// Builds [`WriterProperties`] with per-column dictionary encoding tuned to
+/// the schema: string/binary columns get dictionary + a 2 MiB dictionary page
+/// size limit (efficient for high-cardinality text), while numeric/boolean
+/// columns disable dictionary encoding to avoid wasting CPU on columns that
+/// compress well with run-length or delta encodings.
+fn build_writer_props(schema: &arrow::datatypes::Schema) -> WriterProperties {
+    use parquet::file::properties::EnabledStatistics;
+
+    let mut builder = WriterProperties::builder()
+        .set_compression(parse_parquet_compression(&parquet_compression_str()))
+        .set_dictionary_enabled(false) // global default off; enable per-column below
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_write_batch_size(16384)
+        .set_max_row_group_size(1_048_576)
+        .set_data_page_row_count_limit(20_000);
+
+    for field in schema.fields() {
+        let col_path = parquet::schema::types::ColumnPath::new(vec![field.name().clone()]);
+        match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                builder = builder.set_column_dictionary_enabled(col_path, true);
+            }
+            _ => {
+                builder = builder.set_column_dictionary_enabled(col_path, false);
+            }
+        }
+    }
+
+    builder.build()
+}
+
 /// Builds a [`RuntimeEnv`] with a bounded memory pool.
 ///
 /// Configurable via:
@@ -809,7 +1027,7 @@ impl PotatoDB {
                     }
                 };
                 let local: Arc<dyn ObjectStore> =
-                    Arc::new(LocalFileSystem::new_with_prefix(&abs_path)?);
+                    Arc::new(MmapLocalStore::new(&abs_path)?);
                 let normalized = abs_path.to_string_lossy().to_string();
                 (local, DataLocationKind::Local, String::new(), normalized)
             };
@@ -1160,6 +1378,31 @@ impl PotatoDB {
         &self.replicas
     }
 
+    /// Returns `true` when the write buffer has pending data that must be
+    /// flushed before reads see a consistent snapshot.  Callers can use this
+    /// to decide between a shared (`&self`) read path and an exclusive path.
+    #[must_use]
+    pub fn has_buffered_data(&self) -> bool {
+        !self.write_buffer.is_empty()
+    }
+
+    /// Execute a read-only query without requiring `&mut self`.
+    ///
+    /// This path skips plan-cache mutation and write-buffer flushing, so it
+    /// is safe to call concurrently from multiple readers behind an
+    /// `RwLock::read()`.  Returns an error for mutating SQL.
+    ///
+    /// **Precondition**: the caller must ensure `has_buffered_data()` is
+    /// `false`, or accept stale-read semantics for buffered rows.
+    pub async fn execute_readonly_shared(&self, sql: &str) -> Result<QueryResult, BoxError> {
+        if !is_read_only_sql(sql) {
+            return Err("execute_readonly_shared rejects mutating SQL".into());
+        }
+        let df = self.ctx.sql(sql).await?;
+        let batches = df.collect().await?;
+        Ok(QueryResult::Records(batches))
+    }
+
     /// Returns the number of parquet files currently backing a table.
     ///
     /// # Errors
@@ -1299,6 +1542,9 @@ impl PotatoDB {
             return Ok(());
         }
         let txn_id = self.current_wal_txn_id();
+        // Always append without sync — for autocommit the sync is deferred
+        // to wal_finish_autocommit which writes both the pending entry and
+        // the commit marker with a single fdatasync (group commit).
         if let Some(wal) = self.wal.as_mut() {
             wal.append_no_sync(&WalEntry {
                 txn_id,
@@ -1314,7 +1560,14 @@ impl PotatoDB {
             return Ok(());
         }
         if let Some(wal) = self.wal.as_mut() {
-            wal.commit_no_checkpoint(0)?;
+            // Group-commit: the pending entry was already written (no sync)
+            // by wal_append_pending; now write just the commit marker and
+            // sync once for both entries, halving the fdatasync count.
+            wal.append(&WalEntry {
+                txn_id: 0,
+                status: EntryStatus::Committed,
+                sql: String::new(),
+            })?;
             self.wal_commits_since_checkpoint = self.wal_commits_since_checkpoint.saturating_add(1);
             let elapsed = self.last_wal_checkpoint_at.elapsed();
             if should_checkpoint_autocommit(
@@ -1372,14 +1625,7 @@ impl PotatoDB {
         let prefix = self.table_obj_prefix(table_name);
         let obj_path = ObjPath::from(format!("{prefix}/{filename}"));
 
-        let props = WriterProperties::builder()
-            .set_compression(parse_parquet_compression(&parquet_compression_str()))
-            .set_dictionary_enabled(true)
-            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
-            .set_write_batch_size(16384)
-            .set_max_row_group_size(1_048_576)
-            .set_data_page_row_count_limit(20_000)
-            .build();
+        let props = build_writer_props(&schema);
 
         if self.is_local_disk() {
             let table_meta = self.catalog.tables.get(table_name);
@@ -6296,14 +6542,7 @@ impl PotatoDB {
                 || Arc::new(Schema::empty()),
                 arrow::array::RecordBatch::schema,
             );
-            let props = WriterProperties::builder()
-                .set_compression(parse_parquet_compression(&parquet_compression_str()))
-                .set_dictionary_enabled(true)
-                .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
-                .set_write_batch_size(16384)
-                .set_max_row_group_size(1_048_576)
-                .set_data_page_row_count_limit(20_000)
-                .build();
+            let props = build_writer_props(&schema);
             let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
             for batch in &batches {
                 writer.write(batch)?;

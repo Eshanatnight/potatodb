@@ -98,6 +98,15 @@ impl Processor {
             .await
             .map_err(|e| format!("Connection pool closed: {e}"))?;
         if is_read_only_query(query) {
+            // Fast path: take a shared read lock when there is no buffered data,
+            // allowing concurrent readers without blocking writers for long.
+            {
+                let db = self.db.read().await;
+                if !db.has_buffered_data() {
+                    return db.execute_readonly_shared(query).await;
+                }
+            }
+            // Buffered data exists — fall back to exclusive lock to flush first.
             let mut db = self.db.write().await;
             db.execute_readonly(query).await
         } else {
