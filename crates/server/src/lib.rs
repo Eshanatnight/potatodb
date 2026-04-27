@@ -103,7 +103,9 @@ impl Processor {
             {
                 let db = self.db.read().await;
                 if !db.has_buffered_data() {
-                    return db.execute_readonly_shared(query).await;
+                    let result = db.execute_readonly_shared(query).await;
+                    drop(db);
+                    return result;
                 }
             }
             // Buffered data exists — fall back to exclusive lock to flush first.

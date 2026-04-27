@@ -203,6 +203,7 @@ impl ObjectStore for MmapLocalStore {
         })?;
 
         #[cfg(unix)]
+        #[allow(clippy::as_ptr_cast_mut)]
         unsafe {
             libc::madvise(
                 mmap.as_ptr() as *mut libc::c_void,
@@ -801,8 +802,7 @@ fn build_runtime_env() -> Result<RuntimeEnv, BoxError> {
     let pool_size = std::env::var("POTATODB_MEMORY_LIMIT_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(sys_memory * 3 / 4);
+        .map_or(sys_memory * 3 / 4, |mb| mb * 1024 * 1024);
 
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
@@ -1394,6 +1394,10 @@ impl PotatoDB {
     ///
     /// **Precondition**: the caller must ensure `has_buffered_data()` is
     /// `false`, or accept stale-read semantics for buffered rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is mutating or if query execution fails.
     pub async fn execute_readonly_shared(&self, sql: &str) -> Result<QueryResult, BoxError> {
         if !is_read_only_sql(sql) {
             return Err("execute_readonly_shared rejects mutating SQL".into());
@@ -1604,7 +1608,7 @@ impl PotatoDB {
         ))
     }
 
-    fn next_parquet_file_id(&mut self) -> u64 {
+    const fn next_parquet_file_id(&mut self) -> u64 {
         let id = self.parquet_file_counter;
         self.parquet_file_counter = self.parquet_file_counter.saturating_add(1);
         id
@@ -1625,14 +1629,13 @@ impl PotatoDB {
         let prefix = self.table_obj_prefix(table_name);
         let obj_path = ObjPath::from(format!("{prefix}/{filename}"));
 
+        let props = build_writer_props(&schema);
         if self.is_local_disk() {
-            let props = build_writer_props(&schema);
             let table_meta = self.catalog.tables.get(table_name);
-            let dir = table_meta
-                .map(|m| PathBuf::from(&m.path))
-                .unwrap_or_else(|| {
-                    PathBuf::from(&self.data_url).join(table_name)
-                });
+            let dir = table_meta.map_or_else(
+                || PathBuf::from(&self.data_url).join(table_name),
+                |m| PathBuf::from(&m.path),
+            );
             std::fs::create_dir_all(&dir)?;
             let file_path = dir.join(&filename);
             let owned_batches: Vec<RecordBatch> = batches.to_vec();
@@ -1647,14 +1650,14 @@ impl PotatoDB {
                 writer.close()?;
                 debug_assert!(
                     file_path.exists(),
-                    "write_batches_to_parquet: file missing after write: {file_path:?}"
+                    "write_batches_to_parquet: file missing after write: {}",
+                    file_path.display()
                 );
                 Ok(())
             })
             .await
             .map_err(|e| -> BoxError { format!("spawn_blocking join error: {e}").into() })??;
         } else {
-            let props = build_writer_props(&schema);
             let estimated_bytes = estimate_batch_bytes(batches);
             let mut buf: Vec<u8> = Vec::with_capacity(estimated_bytes / 2 + 4096);
             {
@@ -2161,9 +2164,9 @@ impl PotatoDB {
         Ok(())
     }
 
-    /// Re-registers a table's `ListingTable` with DataFusion so that
+    /// Re-registers a table's `ListingTable` with `DataFusion` so that
     /// newly written Parquet files are visible to subsequent queries.
-    async fn re_register_table(&mut self, table_name: &str) -> Result<(), BoxError> {
+    async fn re_register_table(&self, table_name: &str) -> Result<(), BoxError> {
         let meta = self
             .catalog
             .tables
@@ -5944,7 +5947,7 @@ impl PotatoDB {
             conflict_key: String,
         }
 
-        let total_rows: usize = source_batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = source_batches.iter().map(RecordBatch::num_rows).sum();
         let mut source_rows = Vec::<UpsertRow>::with_capacity(total_rows);
         for batch in &source_batches {
             for row in 0..batch.num_rows() {

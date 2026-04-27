@@ -187,12 +187,12 @@ async fn run_query(
 ) -> Json<QueryResponse> {
     let result = if is_read_only_http(&req.sql) {
         let db = state.db.read().await;
-        if !db.has_buffered_data() {
-            db.execute_readonly_shared(&req.sql).await
-        } else {
+        if db.has_buffered_data() {
             drop(db);
             let mut db = state.db.write().await;
             db.execute_readonly(&req.sql).await
+        } else {
+            db.execute_readonly_shared(&req.sql).await
         }
     } else {
         let mut db = state.db.write().await;
