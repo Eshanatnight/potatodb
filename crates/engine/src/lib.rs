@@ -59,6 +59,8 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
     Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
@@ -67,8 +69,6 @@ use datafusion::optimizer::OptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::execution::memory_pool::FairSpillPool;
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::*;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
@@ -195,12 +195,11 @@ impl ObjectStore for MmapLocalStore {
             return self.inner.get(location).await;
         }
 
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
-            object_store::Error::Generic {
+        let mmap =
+            unsafe { memmap2::Mmap::map(&file) }.map_err(|e| object_store::Error::Generic {
                 store: "MmapLocalStore",
                 source: e.into(),
-            }
-        })?;
+            })?;
 
         #[cfg(unix)]
         #[allow(clippy::as_ptr_cast_mut)]
@@ -225,9 +224,9 @@ impl ObjectStore for MmapLocalStore {
         };
 
         Ok(object_store::GetResult {
-            payload: object_store::GetResultPayload::Stream(Box::pin(
-                futures::stream::once(async move { Ok(data) }),
-            )),
+            payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::once(
+                async move { Ok(data) },
+            ))),
             meta: objmeta,
             range: 0..file_len,
             attributes: object_store::Attributes::new(),
@@ -1026,8 +1025,7 @@ impl PotatoDB {
                         abs_path
                     }
                 };
-                let local: Arc<dyn ObjectStore> =
-                    Arc::new(MmapLocalStore::new(&abs_path)?);
+                let local: Arc<dyn ObjectStore> = Arc::new(MmapLocalStore::new(&abs_path)?);
                 let normalized = abs_path.to_string_lossy().to_string();
                 (local, DataLocationKind::Local, String::new(), normalized)
             };
@@ -5236,7 +5234,8 @@ impl PotatoDB {
 
                 match (&clause.clause_kind, &clause.action) {
                     (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                        let mut update_map: HashMap<String, String> = HashMap::with_capacity(assignments.len());
+                        let mut update_map: HashMap<String, String> =
+                            HashMap::with_capacity(assignments.len());
                         for a in assignments {
                             let col = a.target.to_string().trim_matches('"').to_string();
                             let val = rewrite(&a.value.to_string());
@@ -5774,8 +5773,7 @@ impl PotatoDB {
 
             if inserted_rows > 0 {
                 let table_schema = columns_to_schema(&table_meta.columns)?;
-                let projected =
-                    project_to_table_schema(&table_schema, &target_columns, &batches)?;
+                let projected = project_to_table_schema(&table_schema, &target_columns, &batches)?;
                 self.write_batches_to_parquet(&table_name, table_schema, &projected)
                     .await?;
                 self.re_register_table(&table_name).await?;
@@ -6425,11 +6423,8 @@ impl PotatoDB {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
-            let target_cols: Vec<String> = target_meta
-                .columns
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
+            let target_cols: Vec<String> =
+                target_meta.columns.iter().map(|c| c.name.clone()).collect();
             let source_columns: Vec<String> = target_cols
                 .iter()
                 .filter(|col_name| {
@@ -6447,8 +6442,7 @@ impl PotatoDB {
                 .filter(|name| !target_cols.iter().any(|c| c == *name))
                 .count();
             let table_schema = columns_to_schema(&target_meta.columns)?;
-            let projected =
-                project_to_table_schema(&table_schema, &source_columns, &batches)?;
+            let projected = project_to_table_schema(&table_schema, &source_columns, &batches)?;
             self.write_batches_to_parquet(table_name, table_schema, &projected)
                 .await?;
             self.re_register_table(table_name).await?;
@@ -8267,10 +8261,9 @@ fn project_to_table_schema(
                         if src.data_type() == field.data_type() {
                             Arc::clone(src)
                         } else {
-                            arrow::compute::cast(src.as_ref(), field.data_type())
-                                .unwrap_or_else(|_| {
-                                    arrow::array::new_null_array(field.data_type(), num_rows)
-                                })
+                            arrow::compute::cast(src.as_ref(), field.data_type()).unwrap_or_else(
+                                |_| arrow::array::new_null_array(field.data_type(), num_rows),
+                            )
                         }
                     } else {
                         arrow::array::new_null_array(field.data_type(), num_rows)
