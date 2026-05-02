@@ -59,6 +59,8 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
     Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
@@ -102,6 +104,193 @@ use sql_helpers::{
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A local `ObjectStore` that serves Parquet reads via `mmap(2)`.
+///
+/// Memory-mapping eliminates per-read `read(2)` syscalls and lets the kernel
+/// page-in data with large sequential readahead, which is a significant win
+/// for scan-heavy workloads where `libc_read` dominated the profile.
+/// Writes and metadata operations delegate to the inner `LocalFileSystem`.
+#[derive(Debug)]
+struct MmapLocalStore {
+    inner: LocalFileSystem,
+    root: PathBuf,
+}
+
+impl MmapLocalStore {
+    fn new(root: &std::path::Path) -> object_store::Result<Self> {
+        Ok(Self {
+            inner: LocalFileSystem::new_with_prefix(root)?,
+            root: root.to_path_buf(),
+        })
+    }
+
+    fn resolve_path(&self, location: &ObjPath) -> PathBuf {
+        self.root.join(location.as_ref())
+    }
+}
+
+impl std::fmt::Display for MmapLocalStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MmapLocalStore({})", self.root.display())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for MmapLocalStore {
+    async fn put(
+        &self,
+        location: &ObjPath,
+        payload: object_store::PutPayload,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put(location, payload).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &ObjPath,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart(
+        &self,
+        location: &ObjPath,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart(location).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjPath,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get(&self, location: &ObjPath) -> object_store::Result<object_store::GetResult> {
+        let path = self.resolve_path(location);
+        let file = std::fs::File::open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                object_store::Error::NotFound {
+                    path: path.display().to_string(),
+                    source: e.into(),
+                }
+            } else {
+                object_store::Error::Generic {
+                    store: "MmapLocalStore",
+                    source: e.into(),
+                }
+            }
+        })?;
+        let meta = file.metadata().map_err(|e| object_store::Error::Generic {
+            store: "MmapLocalStore",
+            source: e.into(),
+        })?;
+
+        let file_len = meta.len();
+        if file_len == 0 {
+            return self.inner.get(location).await;
+        }
+
+        let mmap =
+            unsafe { memmap2::Mmap::map(&file) }.map_err(|e| object_store::Error::Generic {
+                store: "MmapLocalStore",
+                source: e.into(),
+            })?;
+
+        #[cfg(unix)]
+        #[allow(clippy::as_ptr_cast_mut)]
+        unsafe {
+            libc::madvise(
+                mmap.as_ptr() as *mut libc::c_void,
+                file_len as usize,
+                libc::MADV_SEQUENTIAL,
+            );
+        }
+
+        let data = bytes::Bytes::from(mmap.to_vec());
+        let objmeta = object_store::ObjectMeta {
+            location: location.clone(),
+            last_modified: meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                .into(),
+            size: file_len,
+            e_tag: None,
+            version: None,
+        };
+
+        Ok(object_store::GetResult {
+            payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::once(
+                async move { Ok(data) },
+            ))),
+            meta: objmeta,
+            range: 0..file_len,
+            attributes: object_store::Attributes::new(),
+        })
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjPath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if options.range.is_some() || options.if_match.is_some() || options.if_none_match.is_some()
+        {
+            return self.inner.get_opts(location, options).await;
+        }
+        self.get(location).await
+    }
+
+    async fn get_range(
+        &self,
+        location: &ObjPath,
+        range: std::ops::Range<u64>,
+    ) -> object_store::Result<bytes::Bytes> {
+        self.inner.get_range(location, range).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjPath,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    async fn head(&self, location: &ObjPath) -> object_store::Result<object_store::ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &ObjPath) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjPath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
 
 /// Which part of constraint validation to run for a batch insert/flush.
 #[derive(Clone, Copy)]
@@ -465,8 +654,8 @@ pub struct PotatoDB {
     write_buffer_byte_threshold: usize,
     /// Flush threshold by buffered age.
     write_buffer_time_threshold: Duration,
-    /// Monotonic suffix for temporary table names.
-    temp_table_counter: u64,
+    /// Monotonic suffix for Parquet file names written by the Arrow writer.
+    parquet_file_counter: u64,
     /// Rows written since last ANALYZE, tracked per table.
     rows_since_analyze: HashMap<String, usize>,
     /// Threshold that triggers automatic ANALYZE.
@@ -511,9 +700,13 @@ pub struct PotatoDB {
 }
 
 /// Returns the Parquet compression setting from `POTATODB_PARQUET_COMPRESSION`,
-/// defaulting to `"zstd(3)"`.
+/// defaulting to `"lz4"`.
+///
+/// LZ4 decompresses 3–5x faster than ZSTD with modest compression-ratio cost,
+/// eliminating the ~30 % CPU overhead that ZSTD decompression + compression
+/// imposed on typical query workloads (AMD uProf profiling, Apr 2026).
 fn parquet_compression_str() -> String {
-    std::env::var("POTATODB_PARQUET_COMPRESSION").unwrap_or_else(|_| "zstd(3)".into())
+    std::env::var("POTATODB_PARQUET_COMPRESSION").unwrap_or_else(|_| "lz4".into())
 }
 
 /// Parses a compression string like `"zstd(3)"`, `"snappy"`, or `"gzip(6)"`
@@ -556,28 +749,95 @@ fn parse_parquet_compression(s: &str) -> parquet::basic::Compression {
     }
 }
 
+/// Builds [`WriterProperties`] with per-column dictionary encoding tuned to
+/// the schema: string/binary columns get dictionary + a 2 MiB dictionary page
+/// size limit (efficient for high-cardinality text), while numeric/boolean
+/// columns disable dictionary encoding to avoid wasting CPU on columns that
+/// compress well with run-length or delta encodings.
+fn build_writer_props(schema: &arrow::datatypes::Schema) -> WriterProperties {
+    use parquet::file::properties::EnabledStatistics;
+
+    let mut builder = WriterProperties::builder()
+        .set_compression(parse_parquet_compression(&parquet_compression_str()))
+        .set_dictionary_enabled(false) // global default off; enable per-column below
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_write_batch_size(16384)
+        .set_max_row_group_size(1_048_576)
+        .set_data_page_row_count_limit(20_000);
+
+    for field in schema.fields() {
+        let col_path = parquet::schema::types::ColumnPath::new(vec![field.name().clone()]);
+        match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                builder = builder.set_column_dictionary_enabled(col_path, true);
+            }
+            _ => {
+                builder = builder.set_column_dictionary_enabled(col_path, false);
+            }
+        }
+    }
+
+    builder.build()
+}
+
+/// Builds a [`RuntimeEnv`] with a bounded memory pool.
+///
+/// Configurable via:
+/// - `POTATODB_MEMORY_LIMIT_MB` — Max memory for query execution (default: 75% of system RAM)
+///
+/// Uses [`FairSpillPool`] which distributes memory fairly across concurrent
+/// operators and supports spill-to-disk, avoiding OOM on large hash joins.
+fn build_runtime_env() -> Result<RuntimeEnv, BoxError> {
+    let sys_memory = {
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if pages > 0 && page_size > 0 {
+            (pages as usize) * (page_size as usize)
+        } else {
+            4 * 1024 * 1024 * 1024 // 4 GiB fallback
+        }
+    };
+
+    let pool_size = std::env::var("POTATODB_MEMORY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(sys_memory * 3 / 4, |mb| mb * 1024 * 1024);
+
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+        .build()?;
+    Ok(runtime)
+}
+
 /// Builds a [`SessionConfig`] tuned for Parquet performance.
 ///
 /// Key settings can be overridden via environment variables:
-/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 32768)
+/// - `POTATODB_BATCH_SIZE` — Arrow batch size during execution (default: 8192)
 /// - `POTATODB_PARQUET_WRITE_BATCH_SIZE` — Parquet write buffer size (default: 16384)
 /// - `POTATODB_TARGET_PARTITIONS` — Number of parallel partitions (default: CPU cores)
 /// - `POTATODB_ENFORCE_BATCH_SIZE_IN_JOINS` — Enforce batch size in hash joins (default: true)
 /// - `POTATODB_COALESCE_BATCHES` — Coalesce small batches between operators (default: true)
+/// - `POTATODB_PREFER_HASH_JOIN` — Prefer hash joins over sort-merge joins (default: false)
 fn build_session_config() -> SessionConfig {
     let parallelism = std::env::var("POTATODB_TARGET_PARTITIONS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
-            std::thread::available_parallelism()
+            let cpus = std::thread::available_parallelism()
                 .map(std::num::NonZero::get)
-                .unwrap_or(4)
+                .unwrap_or(4);
+            // Cap at a reasonable level: excessive partitions (e.g. 512 on a
+            // large EPYC) create massive repartition channel overhead —
+            // SendFuture::poll + DistributionSender::drop + BatchPartitioner
+            // consumed ~14 % of CPU at 512 partitions due to O(N^2) channel
+            // fan-out and lock contention on the distributor gate.
+            cpus.min(16)
         });
 
     let batch_size = std::env::var("POTATODB_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32768);
+        .unwrap_or(8192);
 
     let write_batch_size = std::env::var("POTATODB_PARQUET_WRITE_BATCH_SIZE")
         .ok()
@@ -602,6 +862,15 @@ fn build_session_config() -> SessionConfig {
         })
         .unwrap_or(true);
 
+    let prefer_hash_join = std::env::var("POTATODB_PREFER_HASH_JOIN")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => v.parse::<bool>().ok(),
+        })
+        .unwrap_or(false);
+
     let mut config = SessionConfig::new()
         .with_information_schema(true)
         .with_batch_size(batch_size)
@@ -610,6 +879,8 @@ fn build_session_config() -> SessionConfig {
         .with_coalesce_batches(coalesce_batches);
 
     config.options_mut().optimizer.skip_failed_rules = true;
+    config.options_mut().optimizer.prefer_hash_join = prefer_hash_join;
+    config.options_mut().optimizer.repartition_joins = true;
 
     let parquet = &mut config.options_mut().execution.parquet;
 
@@ -626,6 +897,8 @@ fn build_session_config() -> SessionConfig {
     parquet.max_row_group_size = 1_048_576;
     parquet.write_batch_size = write_batch_size;
     parquet.data_page_row_count_limit = 20_000;
+
+    config.options_mut().execution.sort_spill_reservation_bytes = 64 * 1024 * 1024;
 
     config
 }
@@ -687,7 +960,8 @@ impl PotatoDB {
     /// connection fails, or the catalog cannot be loaded.
     pub async fn new(data_url: String, s3_config: Option<S3Config>) -> Result<Self, BoxError> {
         let config = build_session_config();
-        let ctx = SessionContext::new_with_config(config);
+        let runtime = build_runtime_env()?;
+        let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime));
         ctx.add_optimizer_rule(Arc::new(SplitScalarSubqueries));
 
         // Ensure generate_series table function is available (PostgreSQL-compatible)
@@ -751,8 +1025,7 @@ impl PotatoDB {
                         abs_path
                     }
                 };
-                let local: Arc<dyn ObjectStore> =
-                    Arc::new(LocalFileSystem::new_with_prefix(&abs_path)?);
+                let local: Arc<dyn ObjectStore> = Arc::new(MmapLocalStore::new(&abs_path)?);
                 let normalized = abs_path.to_string_lossy().to_string();
                 (local, DataLocationKind::Local, String::new(), normalized)
             };
@@ -928,7 +1201,7 @@ impl PotatoDB {
             write_buffer_row_threshold,
             write_buffer_byte_threshold,
             write_buffer_time_threshold,
-            temp_table_counter: 0,
+            parquet_file_counter: 0,
             rows_since_analyze: HashMap::new(),
             auto_analyze_threshold_rows,
             pending_analyze_tables: Vec::new(),
@@ -1103,6 +1376,35 @@ impl PotatoDB {
         &self.replicas
     }
 
+    /// Returns `true` when the write buffer has pending data that must be
+    /// flushed before reads see a consistent snapshot.  Callers can use this
+    /// to decide between a shared (`&self`) read path and an exclusive path.
+    #[must_use]
+    pub fn has_buffered_data(&self) -> bool {
+        !self.write_buffer.is_empty()
+    }
+
+    /// Execute a read-only query without requiring `&mut self`.
+    ///
+    /// This path skips plan-cache mutation and write-buffer flushing, so it
+    /// is safe to call concurrently from multiple readers behind an
+    /// `RwLock::read()`.  Returns an error for mutating SQL.
+    ///
+    /// **Precondition**: the caller must ensure `has_buffered_data()` is
+    /// `false`, or accept stale-read semantics for buffered rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SQL is mutating or if query execution fails.
+    pub async fn execute_readonly_shared(&self, sql: &str) -> Result<QueryResult, BoxError> {
+        if !is_read_only_sql(sql) {
+            return Err("execute_readonly_shared rejects mutating SQL".into());
+        }
+        let df = self.ctx.sql(sql).await?;
+        let batches = df.collect().await?;
+        Ok(QueryResult::Records(batches))
+    }
+
     /// Returns the number of parquet files currently backing a table.
     ///
     /// # Errors
@@ -1242,6 +1544,9 @@ impl PotatoDB {
             return Ok(());
         }
         let txn_id = self.current_wal_txn_id();
+        // Always append without sync — for autocommit the sync is deferred
+        // to wal_finish_autocommit which writes both the pending entry and
+        // the commit marker with a single fdatasync (group commit).
         if let Some(wal) = self.wal.as_mut() {
             wal.append_no_sync(&WalEntry {
                 txn_id,
@@ -1257,7 +1562,14 @@ impl PotatoDB {
             return Ok(());
         }
         if let Some(wal) = self.wal.as_mut() {
-            wal.commit_no_checkpoint(0)?;
+            // Group-commit: the pending entry was already written (no sync)
+            // by wal_append_pending; now write just the commit marker and
+            // sync once for both entries, halving the fdatasync count.
+            wal.append(&WalEntry {
+                txn_id: 0,
+                status: EntryStatus::Committed,
+                sql: String::new(),
+            })?;
             self.wal_commits_since_checkpoint = self.wal_commits_since_checkpoint.saturating_add(1);
             let elapsed = self.last_wal_checkpoint_at.elapsed();
             if should_checkpoint_autocommit(
@@ -1294,10 +1606,77 @@ impl PotatoDB {
         ))
     }
 
-    fn next_temp_table_name(&mut self, tag: &str) -> String {
-        let id = self.temp_table_counter;
-        self.temp_table_counter = self.temp_table_counter.saturating_add(1);
-        format!("__potato_{tag}_tmp_{id}")
+    const fn next_parquet_file_id(&mut self) -> u64 {
+        let id = self.parquet_file_counter;
+        self.parquet_file_counter = self.parquet_file_counter.saturating_add(1);
+        id
+    }
+
+    async fn write_batches_to_parquet(
+        &mut self,
+        table_name: &str,
+        schema: SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<ObjPath, BoxError> {
+        let file_id = self.next_parquet_file_id();
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let filename = format!("{ts}_{file_id}.parquet");
+        let prefix = self.table_obj_prefix(table_name);
+        let obj_path = ObjPath::from(format!("{prefix}/{filename}"));
+
+        let props = build_writer_props(&schema);
+        if self.is_local_disk() {
+            let table_meta = self.catalog.tables.get(table_name);
+            let dir = table_meta.map_or_else(
+                || PathBuf::from(&self.data_url).join(table_name),
+                |m| PathBuf::from(&m.path),
+            );
+            std::fs::create_dir_all(&dir)?;
+            let file_path = dir.join(&filename);
+            let owned_batches: Vec<RecordBatch> = batches.to_vec();
+            tokio::task::spawn_blocking(move || -> Result<(), BoxError> {
+                let file = File::create(&file_path)?;
+                let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+                for batch in &owned_batches {
+                    if batch.num_rows() > 0 {
+                        writer.write(batch)?;
+                    }
+                }
+                writer.close()?;
+                debug_assert!(
+                    file_path.exists(),
+                    "write_batches_to_parquet: file missing after write: {}",
+                    file_path.display()
+                );
+                Ok(())
+            })
+            .await
+            .map_err(|e| -> BoxError { format!("spawn_blocking join error: {e}").into() })??;
+        } else {
+            let estimated_bytes = estimate_batch_bytes(batches);
+            let mut buf: Vec<u8> = Vec::with_capacity(estimated_bytes / 2 + 4096);
+            {
+                let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))?;
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        writer.write(batch)?;
+                    }
+                }
+                writer.close()?;
+            }
+            self.store
+                .put(&obj_path, object_store::PutPayload::from(buf))
+                .await?;
+        }
+
+        if let Some(lfc) = self.ctx.runtime_env().cache_manager.get_list_files_cache() {
+            lfc.clear();
+        }
+
+        Ok(obj_path)
     }
 
     async fn buffer_insert_batches(
@@ -1321,7 +1700,42 @@ impl PotatoDB {
             self.flush_table(table_name).await?;
         }
 
-        let (prev_batches_len, prev_row_count, prev_bytes) = {
+        let target_columns = if let Some(ref cols) = columns {
+            cols.clone()
+        } else {
+            self.catalog
+                .tables
+                .get(table_name)
+                .map(|m| m.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+
+        match self
+            .validate_constraints_batch(
+                table_name,
+                &target_columns,
+                &batches,
+                ConstraintValidationPhase::BeforeInsert,
+            )
+            .await
+        {
+            Ok(merges) => {
+                for (cache_key, keys) in merges {
+                    self.merge_uniqueness_keys(&cache_key, &keys);
+                }
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
+        if !self.replaying_wal
+            && let Some(ref mut awal) = self.arrow_wal
+        {
+            awal.append(table_name, &batches)?;
+        }
+
+        {
             let entry = self
                 .write_buffer
                 .entry(table_name.to_string())
@@ -1338,61 +1752,9 @@ impl PotatoDB {
                 entry.first_buffered_at = Instant::now();
             }
 
-            let prev_batches_len = entry.batches.len();
-            let prev_row_count = entry.row_count;
-            let prev_bytes = entry.approx_bytes;
-
-            entry.batches.extend(batches.clone());
+            entry.batches.extend(batches);
             entry.row_count = entry.row_count.saturating_add(incoming_rows);
             entry.approx_bytes = entry.approx_bytes.saturating_add(incoming_bytes);
-
-            (prev_batches_len, prev_row_count, prev_bytes)
-        };
-
-        let (target_columns, batches_for_validate) = {
-            let entry = self
-                .write_buffer
-                .get(table_name)
-                .ok_or_else(|| -> BoxError {
-                    "buffer_insert_batches: missing buffer entry".into()
-                })?;
-            let target_columns: Vec<String> = if let Some(ref cols) = entry.columns {
-                cols.clone()
-            } else {
-                self.catalog
-                    .tables
-                    .get(table_name)
-                    .map(|m| m.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            };
-            (target_columns, entry.batches.clone())
-        };
-
-        if let Err(e) = self
-            .validate_constraints_batch(
-                table_name,
-                &target_columns,
-                &batches_for_validate,
-                ConstraintValidationPhase::BeforeInsert,
-            )
-            .await
-        {
-            let entry = self
-                .write_buffer
-                .get_mut(table_name)
-                .ok_or_else(|| -> BoxError {
-                    "buffer_insert_batches: missing buffer entry".into()
-                })?;
-            entry.batches.truncate(prev_batches_len);
-            entry.row_count = prev_row_count;
-            entry.approx_bytes = prev_bytes;
-            return Err(e);
-        }
-
-        if !self.replaying_wal
-            && let Some(ref mut awal) = self.arrow_wal
-        {
-            awal.append(table_name, &batches)?;
         }
 
         let should_flush = if let Some(entry) = self.write_buffer.get(table_name) {
@@ -1433,38 +1795,22 @@ impl PotatoDB {
                 .unwrap_or_default()
         };
 
-        let merges = self
-            .validate_constraints_batch(
-                table_name,
-                &target_columns,
-                &buffered.batches,
-                ConstraintValidationPhase::BeforeInsert,
-            )
-            .await?;
-
         let row_count = buffered.row_count;
-        let tmp_name = self.next_temp_table_name("flush");
-        let mem = MemTable::try_new(schema, vec![buffered.batches])?;
-        self.ctx.register_table(&tmp_name, Arc::new(mem))?;
 
-        let insert_sql = if let Some(cols) = buffered.columns.as_ref() {
-            if cols.is_empty() {
-                format!("INSERT INTO \"{table_name}\" SELECT * FROM \"{tmp_name}\"")
-            } else {
-                let cols_sql = cols
-                    .iter()
-                    .map(|c| format!("\"{c}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("INSERT INTO \"{table_name}\" ({cols_sql}) SELECT * FROM \"{tmp_name}\"")
-            }
-        } else {
-            format!("INSERT INTO \"{table_name}\" SELECT * FROM \"{tmp_name}\"")
-        };
+        let table_schema = self
+            .catalog
+            .tables
+            .get(table_name)
+            .map(|m| columns_to_schema(&m.columns))
+            .transpose()?
+            .unwrap_or_else(|| schema.clone());
 
-        let write_result = self.ctx.sql(&insert_sql).await?.collect().await.map(|_| ());
-        let _ = self.ctx.deregister_table(&tmp_name);
-        write_result?;
+        let write_batches =
+            project_to_table_schema(&table_schema, &target_columns, &buffered.batches)?;
+
+        self.write_batches_to_parquet(table_name, table_schema, &write_batches)
+            .await?;
+        self.re_register_table(table_name).await?;
 
         // FOREIGN KEY validation requires child rows to exist on disk.
         let empty_batches: &[RecordBatch] = &[];
@@ -1475,12 +1821,6 @@ impl PotatoDB {
             ConstraintValidationPhase::AfterInsert,
         )
         .await?;
-
-        if row_count > 0 {
-            for (cache_key, keys) in merges {
-                self.merge_uniqueness_keys(&cache_key, &keys);
-            }
-        }
 
         if let Some(ref mut awal) = self.arrow_wal {
             awal.checkpoint_table(table_name)?;
@@ -1583,7 +1923,7 @@ impl PotatoDB {
     }
 
     async fn drain_pending_analyze(&mut self) {
-        if self.pending_analyze_tables.is_empty() {
+        if self.pending_analyze_tables.is_empty() || !self.write_buffer.is_empty() {
             return;
         }
         let tables = std::mem::take(&mut self.pending_analyze_tables);
@@ -1822,6 +2162,21 @@ impl PotatoDB {
         Ok(())
     }
 
+    /// Re-registers a table's `ListingTable` with `DataFusion` so that
+    /// newly written Parquet files are visible to subsequent queries.
+    async fn re_register_table(&self, table_name: &str) -> Result<(), BoxError> {
+        let meta = self
+            .catalog
+            .tables
+            .get(table_name)
+            .ok_or_else(|| format!("Table '{table_name}' does not exist"))?
+            .clone();
+        let schema = columns_to_schema(&meta.columns)?;
+        let _ = self.ctx.deregister_table(table_name);
+        self.register_listing_table(table_name, schema, &meta.path, &meta.partition_columns)
+            .await
+    }
+
     /// Deletes all `.parquet` files under a table's storage prefix.
     async fn delete_parquet_files(&self, table_name: &str) -> Result<(), BoxError> {
         let prefix = self.table_obj_prefix(table_name);
@@ -1937,6 +2292,28 @@ impl PotatoDB {
         if self.is_local_disk() {
             std::fs::create_dir_all(&table_meta.path)?;
         }
+
+        let has_data = !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0);
+        if has_data {
+            let write_result = self
+                .write_batches_to_parquet(table_name, schema, &batches)
+                .await;
+
+            if let Err(e) = write_result {
+                self.register_listing_table(
+                    table_name,
+                    table_schema,
+                    &table_meta.path,
+                    &table_meta.partition_columns,
+                )
+                .await
+                .ok();
+                self.restore_table_from_snapshot(table_name, original_schema, original_batches)
+                    .await;
+                return Err(e);
+            }
+        }
+
         self.register_listing_table(
             table_name,
             table_schema,
@@ -1944,38 +2321,6 @@ impl PotatoDB {
             &table_meta.partition_columns,
         )
         .await?;
-
-        let has_data = !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0);
-        if has_data {
-            let prep = MemTable::try_new(schema, vec![batches]).and_then(|mem| {
-                self.ctx
-                    .register_table("__potato_rewrite_tmp", Arc::new(mem))?;
-                Ok(())
-            });
-
-            let write_result: Result<(), BoxError> = if let Err(e) = prep {
-                Err(e.into())
-            } else {
-                let r = match self
-                    .ctx
-                    .sql(&format!(
-                        "INSERT INTO \"{table_name}\" SELECT * FROM __potato_rewrite_tmp"
-                    ))
-                    .await
-                {
-                    Ok(df) => df.collect().await,
-                    Err(e) => Err(e),
-                };
-                let _ = self.ctx.deregister_table("__potato_rewrite_tmp");
-                r.map(|_| ()).map_err(Into::into)
-            };
-
-            if let Err(e) = write_result {
-                self.restore_table_from_snapshot(table_name, original_schema, original_batches)
-                    .await;
-                return Err(e);
-            }
-        }
 
         self.refresh_table_file_stats_light(table_name).await?;
 
@@ -4094,6 +4439,13 @@ impl PotatoDB {
         }
 
         let schema = columns_to_schema(&columns)?;
+
+        let has_data = !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0);
+        if has_data {
+            self.write_batches_to_parquet(table_name, schema.clone(), &batches)
+                .await?;
+        }
+
         self.register_listing_table(
             table_name,
             schema.clone(),
@@ -4101,22 +4453,6 @@ impl PotatoDB {
             partition_columns,
         )
         .await?;
-
-        let has_data = !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0);
-        if has_data {
-            let mem_schema = Arc::new(arrow_schema);
-            let mem = MemTable::try_new(mem_schema, vec![batches])?;
-            self.ctx
-                .register_table("__potato_ctas_tmp", Arc::new(mem))?;
-            self.ctx
-                .sql(&format!(
-                    "INSERT INTO \"{table_name}\" SELECT * FROM __potato_ctas_tmp"
-                ))
-                .await?
-                .collect()
-                .await?;
-            self.ctx.deregister_table("__potato_ctas_tmp")?;
-        }
 
         let meta = TableMeta {
             name: table_name.to_string(),
@@ -4898,7 +5234,8 @@ impl PotatoDB {
 
                 match (&clause.clause_kind, &clause.action) {
                     (MergeClauseKind::Matched, MergeAction::Update { assignments }) => {
-                        let mut update_map: HashMap<String, String> = HashMap::new();
+                        let mut update_map: HashMap<String, String> =
+                            HashMap::with_capacity(assignments.len());
                         for a in assignments {
                             let col = a.target.to_string().trim_matches('"').to_string();
                             let val = rewrite(&a.value.to_string());
@@ -5435,20 +5772,11 @@ impl PotatoDB {
                 .await?;
 
             if inserted_rows > 0 {
-                let schema = batches[0].schema();
-                let tmp_name = self.next_temp_table_name("ins");
-                let mem = MemTable::try_new(schema.clone(), vec![batches.clone()])?;
-                self.ctx.register_table(&tmp_name, Arc::new(mem))?;
-                let cols_sql = target_columns
-                    .iter()
-                    .map(|c| format!("\"{c}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let insert_sql = format!(
-                    "INSERT INTO \"{table_name}\" ({cols_sql}) SELECT * FROM \"{tmp_name}\""
-                );
-                self.ctx.sql(&insert_sql).await?.collect().await?;
-                let _ = self.ctx.deregister_table(&tmp_name);
+                let table_schema = columns_to_schema(&table_meta.columns)?;
+                let projected = project_to_table_schema(&table_schema, &target_columns, &batches)?;
+                self.write_batches_to_parquet(&table_name, table_schema, &projected)
+                    .await?;
+                self.re_register_table(&table_name).await?;
 
                 // Update FTS inverted indexes for the new rows (only when this table has FTS).
                 let table_has_fts = self
@@ -5617,11 +5945,12 @@ impl PotatoDB {
             conflict_key: String,
         }
 
-        let mut source_rows = Vec::<UpsertRow>::new();
+        let total_rows: usize = source_batches.iter().map(RecordBatch::num_rows).sum();
+        let mut source_rows = Vec::<UpsertRow>::with_capacity(total_rows);
         for batch in &source_batches {
             for row in 0..batch.num_rows() {
-                let mut value_map = HashMap::new();
-                let mut row_values_sql = Vec::new();
+                let mut value_map = HashMap::with_capacity(target_columns.len());
+                let mut row_values_sql = Vec::with_capacity(target_columns.len());
                 for (idx, col_name) in target_columns.iter().enumerate() {
                     let literal = array_value_to_sql_literal(batch.column(idx).as_ref(), row);
                     value_map.insert(col_name.clone(), literal.clone());
@@ -5652,8 +5981,8 @@ impl PotatoDB {
             ));
         }
 
-        let mut conflict_predicates = Vec::new();
-        let mut seen_conflict_keys = HashSet::new();
+        let mut conflict_predicates = Vec::with_capacity(source_rows.len());
+        let mut seen_conflict_keys = HashSet::with_capacity(source_rows.len());
         for row in &source_rows {
             if !seen_conflict_keys.insert(row.conflict_key.clone()) {
                 continue;
@@ -5667,7 +5996,7 @@ impl PotatoDB {
             conflict_predicates.push(format!("({pred})"));
         }
 
-        let mut existing_conflict_keys = HashSet::new();
+        let mut existing_conflict_keys = HashSet::with_capacity(source_rows.len());
         if !conflict_predicates.is_empty() {
             let conflict_sql = format!(
                 "SELECT * FROM \"{table_name}\" WHERE {}",
@@ -6082,55 +6411,41 @@ impl PotatoDB {
         let mut source_only_cols = 0usize;
 
         if total_rows > 0 {
-            let schema = batches[0].schema();
-            let mem = MemTable::try_new(schema, vec![batches.clone()])?;
-            self.ctx
-                .register_table("__potato_copy_tmp", Arc::new(mem))?;
             let target_meta = self
                 .catalog
                 .tables
                 .get(table_name)
-                .ok_or_else(|| format!("Table '{table_name}' does not exist"))?;
+                .ok_or_else(|| format!("Table '{table_name}' does not exist"))?
+                .clone();
             let source_fields: HashSet<String> = batches[0]
                 .schema()
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())
                 .collect();
-            let target_cols = target_meta
-                .columns
+            let target_cols: Vec<String> =
+                target_meta.columns.iter().map(|c| c.name.clone()).collect();
+            let source_columns: Vec<String> = target_cols
                 .iter()
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>();
-            let projection = target_cols
-                .iter()
-                .map(|col_name| {
-                    if source_fields.contains(col_name) {
-                        format!("\"{col_name}\"")
+                .filter(|col_name| {
+                    if source_fields.contains(*col_name) {
+                        true
                     } else {
                         missing_target_cols = missing_target_cols.saturating_add(1);
-                        format!("NULL AS \"{col_name}\"")
+                        false
                     }
                 })
-                .collect::<Vec<_>>()
-                .join(", ");
+                .cloned()
+                .collect();
             source_only_cols = source_fields
                 .iter()
                 .filter(|name| !target_cols.iter().any(|c| c == *name))
                 .count();
-            let target_col_list = target_cols
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.ctx
-                .sql(&format!(
-                    "INSERT INTO \"{table_name}\" ({target_col_list}) SELECT {projection} FROM __potato_copy_tmp"
-                ))
-                .await?
-                .collect()
+            let table_schema = columns_to_schema(&target_meta.columns)?;
+            let projected = project_to_table_schema(&table_schema, &source_columns, &batches)?;
+            self.write_batches_to_parquet(table_name, table_schema, &projected)
                 .await?;
-            self.ctx.deregister_table("__potato_copy_tmp")?;
+            self.re_register_table(table_name).await?;
         }
 
         self.validate_not_null_table(table_name).await?;
@@ -6198,9 +6513,7 @@ impl PotatoDB {
                 || Arc::new(Schema::empty()),
                 arrow::array::RecordBatch::schema,
             );
-            let props = WriterProperties::builder()
-                .set_compression(parse_parquet_compression(&parquet_compression_str()))
-                .build();
+            let props = build_writer_props(&schema);
             let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
             for batch in &batches {
                 writer.write(batch)?;
@@ -7925,6 +8238,44 @@ fn sql_column_to_catalog(col: &SqlColumnDef) -> ColumnDef {
         data_type: col.data_type.to_string(),
         nullable,
     }
+}
+
+/// Projects `batches` (whose columns correspond to `source_columns`) onto
+/// `table_schema`, filling any column not present in `source_columns` with a
+/// null array.  The returned batches always have the full table schema.
+fn project_to_table_schema(
+    table_schema: &SchemaRef,
+    source_columns: &[String],
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>, BoxError> {
+    let mut result = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let num_rows = batch.num_rows();
+        let columns: Vec<Arc<dyn Array>> = table_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if let Some(idx) = source_columns.iter().position(|c| c == field.name()) {
+                    if idx < batch.num_columns() {
+                        let src = batch.column(idx);
+                        if src.data_type() == field.data_type() {
+                            Arc::clone(src)
+                        } else {
+                            arrow::compute::cast(src.as_ref(), field.data_type()).unwrap_or_else(
+                                |_| arrow::array::new_null_array(field.data_type(), num_rows),
+                            )
+                        }
+                    } else {
+                        arrow::array::new_null_array(field.data_type(), num_rows)
+                    }
+                } else {
+                    arrow::array::new_null_array(field.data_type(), num_rows)
+                }
+            })
+            .collect();
+        result.push(RecordBatch::try_new(Arc::clone(table_schema), columns)?);
+    }
+    Ok(result)
 }
 
 /// Builds an Arrow [`Schema`] from a slice of catalog [`ColumnDef`]s.

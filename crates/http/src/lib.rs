@@ -173,12 +173,32 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     }
 }
 
+fn is_read_only_http(sql: &str) -> bool {
+    let first = sql.split_whitespace().next().unwrap_or("").to_uppercase();
+    matches!(
+        first.as_str(),
+        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "EXPLAIN" | "VALUES"
+    )
+}
+
 async fn run_query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> Json<QueryResponse> {
-    let mut db = state.db.write().await;
-    match db.execute(&req.sql).await {
+    let result = if is_read_only_http(&req.sql) {
+        let db = state.db.read().await;
+        if db.has_buffered_data() {
+            drop(db);
+            let mut db = state.db.write().await;
+            db.execute_readonly(&req.sql).await
+        } else {
+            db.execute_readonly_shared(&req.sql).await
+        }
+    } else {
+        let mut db = state.db.write().await;
+        db.execute(&req.sql).await
+    };
+    match result {
         Ok(QueryResult::Message(msg)) => Json(QueryResponse {
             kind: "message".to_string(),
             message: Some(msg),
