@@ -1,7 +1,5 @@
-# target-cpu=native enables AVX-512 SIMD on AMD EPYC for vectorized Arrow
-# kernels, hash operations, and memory copies. Disable for CI/portable builds.
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
+# For local max throughput on a known host, run with:
+#   RUSTFLAGS="-C target-cpu=native" cargo build
+# (AVX-512 on capable x86_64 hosts, etc.) Omit for CI/portable binaries.
 [env]
 MACOSX_DEPLOYMENT_TARGET = "26.0"
